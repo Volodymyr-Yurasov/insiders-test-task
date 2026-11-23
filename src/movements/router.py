@@ -1,10 +1,18 @@
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from redis.asyncio import Redis
 
 from src.auth.dependencies import CurrentUser, current_user
 from src.database import DbSession
+from src.idempotency import service as idempotency_service
+from src.idempotency.constants import REPLAYED_HEADER
+from src.idempotency.dependencies import IdempotencyKey
 from src.movements import service as movements_service
 from src.movements.constants import MovementType
 from src.movements.schemas import (
@@ -15,7 +23,9 @@ from src.movements.schemas import (
 )
 from src.notifications import service as notifications_service
 from src.notifications.dependencies import NotifierDep
+from src.notifications.service import Notifier
 from src.pagination import Page, Pagination
+from src.redis import get_redis
 from src.reports.dependencies import ValuationCache
 
 # Storekeepers and admins may both create movements (spec 2.6).
@@ -23,7 +33,11 @@ router = APIRouter(prefix="/movements", tags=["movements"], dependencies=[Depend
 
 ERRORS: dict[int | str, dict[str, Any]] = {
     404: {"description": "Unknown warehouse, or unknown/deleted SKUs (all listed)"},
-    409: {"description": "Insufficient stock (every shortage listed) or inactive warehouse"},
+    409: {
+        "description": "Insufficient stock (every shortage listed), inactive warehouse, "
+        "or the same Idempotency-Key is still in flight"
+    },
+    422: {"description": "Invalid request, or Idempotency-Key reused with a different request"},
     503: {"description": "Lock wait timed out; retry after Retry-After seconds"},
 }
 
@@ -54,6 +68,36 @@ async def list_movements(
     )
 
 
+@dataclass(frozen=True)
+class _WriteContext:
+    """Everything a movement write needs around the engine call."""
+
+    user_id: int
+    db: DbSession
+    redis: Redis
+    valuation_cache: ValuationCache
+    notifier: Notifier
+    background_tasks: BackgroundTasks
+    idempotency_key: str | None
+
+
+async def _write_context(
+    user: CurrentUser,
+    db: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
+    valuation_cache: ValuationCache,
+    notifier: NotifierDep,
+    background_tasks: BackgroundTasks,
+    idempotency_key: IdempotencyKey = None,
+) -> _WriteContext:
+    return _WriteContext(
+        user.id, db, redis, valuation_cache, notifier, background_tasks, idempotency_key
+    )
+
+
+WriteContext = Annotated[_WriteContext, Depends(_write_context)]
+
+
 @router.post(
     "",
     response_model=OperationRead,
@@ -61,16 +105,13 @@ async def list_movements(
     summary="Record one movement (IN / OUT / TRANSFER)",
     responses=ERRORS,
 )
-async def create_movement(
-    body: MovementCreate,
-    user: CurrentUser,
-    db: DbSession,
-    valuation_cache: ValuationCache,
-    notifier: NotifierDep,
-    background_tasks: BackgroundTasks,
-) -> OperationRead:
-    command = movements_service.Command.single(body)
-    return await _record(command, user.id, db, valuation_cache, notifier, background_tasks)
+async def create_movement(body: MovementCreate, ctx: WriteContext) -> OperationRead | JSONResponse:
+    return await _record(
+        ctx,
+        "movement",
+        body,
+        lambda key, fp: movements_service.Command.single(body, key=key, fingerprint=fp),
+    )
 
 
 @router.post(
@@ -84,31 +125,58 @@ async def create_movement(
     ),
     responses=ERRORS,
 )
-async def create_batch(
-    body: BatchCreate,
-    user: CurrentUser,
-    db: DbSession,
-    valuation_cache: ValuationCache,
-    notifier: NotifierDep,
-    background_tasks: BackgroundTasks,
-) -> OperationRead:
-    command = movements_service.Command.batch(body)
-    return await _record(command, user.id, db, valuation_cache, notifier, background_tasks)
+async def create_batch(body: BatchCreate, ctx: WriteContext) -> OperationRead | JSONResponse:
+    return await _record(
+        ctx,
+        "batch",
+        body,
+        lambda key, fp: movements_service.Command.batch(body, key=key, fingerprint=fp),
+    )
+
+
+def _replayed(status_code: int, body: dict[str, Any]) -> JSONResponse:
+    return JSONResponse(body, status_code=status_code, headers={REPLAYED_HEADER: "true"})
 
 
 async def _record(
-    command: movements_service.Command,
-    user_id: int,
-    db: DbSession,
-    valuation_cache: ValuationCache,
-    notifier: NotifierDep,
-    background_tasks: BackgroundTasks,
-) -> OperationRead:
-    """Run the engine, then the post-commit side effects. Any error raises before this point
-    returns, so a rolled-back request neither invalidates the cache nor notifies."""
-    result = await movements_service.execute(db, user_id, command)
-    await valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
+    ctx: _WriteContext,
+    endpoint: str,
+    body: BaseModel,
+    build: Callable[[str | None, str | None], movements_service.Command],
+) -> OperationRead | JSONResponse:
+    """Idempotency check -> engine -> post-commit side effects.
+
+    Errors raise before any side effect, so a rolled-back request neither invalidates the
+    cache nor notifies, and its idempotency marker is released for a real retry.
+    """
+    key = ctx.idempotency_key
+    request_fp = idempotency_service.fingerprint(endpoint, body) if key else None
+    token: str | None = None
+    if key is not None and request_fp is not None:
+        decision = await idempotency_service.begin(ctx.redis, ctx.user_id, key, request_fp)
+        if isinstance(decision, idempotency_service.Replay):
+            return _replayed(decision.status_code, decision.body)
+        token = decision.token
+
+    try:
+        result = await movements_service.execute(ctx.db, ctx.user_id, build(key, request_fp))
+    except Exception:
+        if key is not None and token is not None:
+            await idempotency_service.release(ctx.redis, ctx.user_id, key, token)
+        raise
+
+    payload = result.operation.model_dump(mode="json")
+    if key is not None and request_fp is not None and token is not None:
+        await idempotency_service.complete(
+            ctx.redis, ctx.user_id, key, request_fp, status.HTTP_201_CREATED, payload
+        )
+    if result.replayed:  # the DB already had this key's operation: nothing new was written
+        return _replayed(status.HTTP_201_CREATED, payload)
+
+    await ctx.valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
     if result.low_stock:
         # Runs after the response is sent (spec 2.5: the HTTP response is not blocked).
-        background_tasks.add_task(notifications_service.safe_send, notifier, result.low_stock)
+        ctx.background_tasks.add_task(
+            notifications_service.safe_send, ctx.notifier, result.low_stock
+        )
     return result.operation

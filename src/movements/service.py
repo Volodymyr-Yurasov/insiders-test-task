@@ -15,10 +15,12 @@ from datetime import datetime
 from typing import Any
 
 from sqlalchemy import insert, select, text
+from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.exceptions import ServiceBusy
+from src.idempotency.exceptions import IdempotencyKeyReused
 from src.movements import stock
 from src.movements.config import movements_settings
 from src.movements.constants import MovementType
@@ -41,17 +43,22 @@ class Command:
     from_warehouse_id: int | None
     to_warehouse_id: int | None
     items: list[tuple[str, int]]  # (sku, quantity), SKUs unique
+    idempotency_key: str | None = None
+    fingerprint: str | None = None
 
     @classmethod
-    def single(cls, body: MovementCreate) -> "Command":
-        return cls(
-            body.type, body.from_warehouse_id, body.to_warehouse_id, [(body.sku, body.quantity)]
-        )
+    def single(
+        cls, body: MovementCreate, *, key: str | None = None, fingerprint: str | None = None
+    ) -> "Command":
+        items = [(body.sku, body.quantity)]
+        return cls(body.type, body.from_warehouse_id, body.to_warehouse_id, items, key, fingerprint)
 
     @classmethod
-    def batch(cls, body: BatchCreate) -> "Command":
+    def batch(
+        cls, body: BatchCreate, *, key: str | None = None, fingerprint: str | None = None
+    ) -> "Command":
         items = [(item.sku, item.quantity) for item in body.items]
-        return cls(body.type, body.from_warehouse_id, body.to_warehouse_id, items)
+        return cls(body.type, body.from_warehouse_id, body.to_warehouse_id, items, key, fingerprint)
 
 
 @dataclass(frozen=True)
@@ -66,6 +73,8 @@ class ExecutionResult:
     operation: OperationRead
     # Source-warehouse threshold crossings caused by this operation (spec 2.5, D6).
     low_stock: list[LowStockAlert]
+    # True when an Idempotency-Key matched an already committed operation: nothing written.
+    replayed: bool = False
 
 
 async def execute(db: AsyncSession, user_id: int, command: Command) -> ExecutionResult:
@@ -83,6 +92,30 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Executio
     await db.execute(
         text(f"SET LOCAL lock_timeout = '{int(movements_settings.LOCK_TIMEOUT_MS)}ms'")
     )
+
+    # FIRST write: claim the operation. With an Idempotency-Key this is the database-level
+    # exactly-once guarantee (Postgres's SET NX): a concurrent duplicate blocks on the unique
+    # index until we finish, then hits DO NOTHING and replays. Done before any row locks, so
+    # a waiting duplicate holds nothing (deadlock-safe). Rolled back with everything else if
+    # the stock check fails.
+    claimed = (
+        await db.execute(
+            pg_insert(Operation)
+            .values(
+                type=command.type,
+                performed_by=user_id,
+                idempotency_key=command.idempotency_key,
+                request_fingerprint=command.fingerprint,
+            )
+            .on_conflict_do_nothing(
+                index_elements=[Operation.performed_by, Operation.idempotency_key]
+            )
+            .returning(Operation.id, Operation.created_at)
+        )
+    ).one_or_none()
+    if claimed is None:
+        return await _replay(db, user_id, command)
+    operation_id, created_at = claimed
 
     await _lock_active_warehouses(db, command)
     products = await _lock_products(db, command)
@@ -107,13 +140,6 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Executio
         if shortages:
             raise InsufficientStock(shortages=shortages)
 
-    operation_id, created_at = (
-        await db.execute(
-            insert(Operation)
-            .values(type=command.type, performed_by=user_id)
-            .returning(Operation.id, Operation.created_at)
-        )
-    ).one()
     inserted = await db.execute(
         insert(StockMovement)
         .values(
@@ -154,6 +180,46 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Executio
         ],
     )
     return ExecutionResult(operation, _low_stock_crossings(command, products, before, operation_id))
+
+
+async def _replay(db: AsyncSession, user_id: int, command: Command) -> ExecutionResult:
+    """The Idempotency-Key already has a committed operation: return it, write nothing."""
+    operation = (
+        await db.execute(
+            select(Operation).where(
+                Operation.performed_by == user_id,
+                Operation.idempotency_key == command.idempotency_key,
+            )
+        )
+    ).scalar_one()
+    if operation.request_fingerprint != command.fingerprint:
+        raise IdempotencyKeyReused()
+    movements = (
+        await db.execute(
+            select(
+                StockMovement.id,
+                StockMovement.product_id,
+                Product.sku,
+                StockMovement.quantity,
+                StockMovement.from_warehouse_id,
+                StockMovement.to_warehouse_id,
+            )
+            .join(Product, Product.id == StockMovement.product_id)
+            .where(StockMovement.operation_id == operation.id)
+            .order_by(StockMovement.id)
+        )
+    ).all()
+    replay = OperationRead(
+        id=operation.id,
+        type=operation.type,
+        performed_by=operation.performed_by,
+        created_at=operation.created_at,
+        movements=[MovementRead.model_validate(m._mapping) for m in movements],
+    )
+    # Read-only: end the transaction. Only AFTER building the response: a rollback expires
+    # loaded ORM objects, and touching them afterwards would lazy-load (illegal in async).
+    await db.rollback()
+    return ExecutionResult(operation=replay, low_stock=[], replayed=True)
 
 
 def _low_stock_crossings(

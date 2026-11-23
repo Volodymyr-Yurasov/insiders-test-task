@@ -672,3 +672,51 @@ Parent plan: [../PLAN.md](../PLAN.md) Step 7. Spec 2.5: when a write-off takes a
 ### Checkpoint: Step 7 complete
 - [x] Suite green; ruff + mypy clean; compose: an OUT crossing the threshold logs "email sent" **after** uvicorn's `201` access line
 - [x] Commit (no self-credit)
+
+---
+
+# Implementation Plan: Step 8 — Idempotency-Key (bonus 1)
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 8. Bonus spec: support an `Idempotency-Key` header, cache the result in Redis for 24 h, and make sure a repeated request never writes off twice.
+
+## Architecture Decisions
+- **Scope:** `POST /movements` and `POST /movements/batch`.
+  - The header is optional: 1–255 visible ASCII characters (`[\x21-\x7E]`), else 422.
+  - Keys are scoped **per user**, so the same key from two users never collides.
+- **Fingerprint:** `sha256(path + canonical JSON of the *validated* body)`.
+  - The same semantic request matches even if formatting differs (e.g. `sku: "p-1"` vs `"P-1"`).
+  - Single vs batch never match each other.
+- **Two layers:**
+  1. **Redis (fast path, 24 h result cache)**, key `idem:{user_id}:{key}`:
+     - `SET … {"state":"processing","fp","token"} NX EX 30`.
+     - If the key is taken, look at the record:
+       - `processing` + same fp → `409 idempotency_in_progress` + `Retry-After: 1`.
+       - `done` + same fp → **replay** the stored status and body with `Idempotent-Replayed: true`.
+       - Any other fp → `422 idempotency_key_reused`.
+     - On success → `SET {"state":"done","fp","status","body"} EX 86400`.
+     - On any error → release the key with a compare-and-delete on the token (Lua), so a retry runs for real. A failed request wrote nothing, so re-executing it is not a duplicate.
+  2. **Postgres (the guarantee):** the engine's **first** write is
+     `INSERT INTO operation (…, idempotency_key, request_fingerprint) … ON CONFLICT (performed_by, idempotency_key) DO NOTHING RETURNING id`.
+     - The `operation` insert moves to the start of the transaction (before the locks; deadlock-safe, since a waiter holds no locks).
+     - A concurrent duplicate blocks on the unique index. If the first commits → DO NOTHING → load the stored operation and **replay it from the DB** (fingerprint checked, mismatch → 422). If the first rolls back → this one proceeds.
+     - This covers the crash window (DB committed, Redis not updated), an expired `processing` marker, and **Redis being down** entirely.
+- **Migration `0008`:** `operation.request_fingerprint varchar(64)` (nullable).
+- **Replays** never invalidate the cache or notify: nothing new was written. *(Step 9 rule: replays won't consume rate-limit quota.)*
+- **Redis errors** in the idempotency layer → log and fall back to the DB layer only.
+- **Config:** `IDEMPOTENCY_TTL_S = 86400`, `IDEMPOTENCY_PROCESSING_TTL_S = 30` (well above `LOCK_TIMEOUT_MS`).
+
+## Task List
+- [x] Task 30: Engine: operation-first `ON CONFLICT` insert, DB replay, migration `0008`
+- [x] Task 31: `src/idempotency/` Redis layer + header dependency + wiring in `_record`
+- [x] Task 32: Tests:
+  - sequential replay
+  - payload/endpoint mismatch → 422
+  - per-user scope
+  - a failed request releases the key
+  - invalid header → 422
+  - concurrent duplicates → exactly one operation
+  - Redis down → DB backstop replays and rejects mismatches
+
+### Checkpoint: Step 8 complete
+- [x] Suite green; ruff + mypy clean; alembic check; compose replay via curl
+- [x] Commit (no self-credit)

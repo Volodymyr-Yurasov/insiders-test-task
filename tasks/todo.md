@@ -733,3 +733,26 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
 ## Checkpoint: Step 7 complete
 - [x] Suite green; ruff + mypy clean; compose log order: `201` access line, then "email sent"
 - [x] Commit (no self-credit)
+
+---
+---
+
+# Todo — Step 8: Idempotency-Key
+
+## Task 30: DB layer (exactly-once guarantee)
+- [x] Migration `0008`: `operation.request_fingerprint`
+- [x] `Command` carries `idempotency_key` + `fingerprint`; the operation is inserted first with `ON CONFLICT DO NOTHING`. On conflict: load the operation + movements (with SKUs) → `ExecutionResult(replayed=True)`, or 422 on a fingerprint mismatch.
+- **Files:** `src/movements/{models,service}.py`, `alembic/versions/…_operation_request_fingerprint.py`
+
+## Task 31: Redis layer + wiring
+- [x] `src/idempotency/{config,exceptions,service,dependencies}.py`: `begin` → Proceed(token) | Replay(status, body) | raise InProgress / KeyReused; `complete`; `release` (Lua compare-and-delete); Redis errors → DB layer only
+- [x] `_record` integrates both layers; replays return the stored body with `Idempotent-Replayed: true` and skip side effects
+
+## Task 32: Tests (`tests/idempotency/test_idempotency.py`)
+- [x] `test_idempotent_replay` (replay, mismatch, per-user scope, failure releases the key, bad header)
+- [x] `test_concurrent_duplicates_write_once`
+- [x] `test_db_backstop_when_redis_is_down`
+
+## Checkpoint: Step 8 complete
+- [x] Suite green; ruff + mypy clean; alembic check; compose replay
+- [x] Commit (no self-credit)
