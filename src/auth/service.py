@@ -2,7 +2,7 @@ import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -151,6 +151,8 @@ async def issue_token_pair(
 
     Commits, so a rotation's revoke + insert land atomically together.
     """
+    if family_id is None:  # a fresh login (not a rotation): good moment for housekeeping
+        await _prune_expired_refresh_tokens(db)
     raw = utils.new_refresh_token()
     db.add(
         RefreshToken(
@@ -228,5 +230,26 @@ async def _revoke_family(db: AsyncSession, family_id: uuid.UUID) -> None:
         update(RefreshToken)
         .where(RefreshToken.family_id == family_id, RefreshToken.revoked_at.is_(None))
         .values(revoked_at=func.now())
+        .execution_options(synchronize_session=False)
+    )
+
+
+async def _prune_expired_refresh_tokens(db: AsyncSession) -> None:
+    """Lazy cleanup: delete a bounded batch of long-expired tokens. No scheduler needed.
+
+    Tokens expired (or revoked) within the retention window are kept so a replayed old token
+    is still recognized as reuse. SKIP LOCKED + LIMIT: concurrent logins never wait on each
+    other, and a large backlog can't make one login slow.
+    """
+    cutoff = func.now() - timedelta(days=auth_settings.REFRESH_TOKEN_RETENTION_DAYS)
+    doomed = (
+        select(RefreshToken.id)
+        .where(RefreshToken.expires_at < cutoff)
+        .limit(auth_settings.REFRESH_TOKEN_PRUNE_BATCH)
+        .with_for_update(skip_locked=True)
+    )
+    await db.execute(
+        delete(RefreshToken)
+        .where(RefreshToken.id.in_(doomed.scalar_subquery()))
         .execution_options(synchronize_session=False)
     )

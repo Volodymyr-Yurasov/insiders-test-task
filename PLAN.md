@@ -189,8 +189,10 @@ Each step ends with a **check** that must pass before the next step starts. Test
   Plus one `GET /users` assertion in the existing admin test.
 
 ### Step 4 — Movement engine (core: 2.1 + 2.2)
-- `POST /movements`: single line. `type` + product_id/sku + qty + from/to by type.
-- `POST /movements/batch`: `type ∈ {OUT, TRANSFER}`, `from`, `to?`, `items: [{sku, quantity}]` (1..100 items).
+- `POST /movements`: single line. `type` + `sku` + qty + from/to by type. Products are identified by SKU everywhere, as in the batch API.
+- `POST /movements/batch`: `type ∈ {IN, OUT, TRANSFER}` (IN reuses the same engine at no extra cost), `from`, `to?`, `items: [{sku, quantity}]` (1..100 items).
+- READ COMMITTED is set **explicitly** on the engine (D4). Lock timeout / deadlock → `503 service_busy` + `Retry-After`.
+- The `operation.idempotency_key` column + unique constraint ship in this migration; Step 8 only adds the logic.
 - Service algorithm (one transaction):
   1. Validate the shape: from/to required by type, `from ≠ to`, no duplicate SKUs (D5), qty > 0.
   2. Lock warehouses involved `FOR SHARE` and check `is_active`. Lock order is always warehouses, then products.

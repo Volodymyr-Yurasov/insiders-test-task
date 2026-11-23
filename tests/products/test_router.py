@@ -28,7 +28,8 @@ async def test_product_crud(
 
     url = f"/products/{product['id']}"
     # Read: any authenticated user.
-    assert (await client.get(url, headers=storekeeper_headers)).json() == product
+    detail = (await client.get(url, headers=storekeeper_headers)).json()
+    assert detail == {**product, "total_stock": 0, "stock_by_warehouse": []}
 
     # Patch (admin): price + threshold; SKU is immutable (extra field rejected).
     patched = await client.patch(

@@ -385,3 +385,114 @@ T15 and T16 are independent of each other; both are sequenced after T13/T14.
 | Decimal precision / float input surprises (`0.1 + 0.2`) | Med | `Numeric(12,2)` + a `decimal_places=2` validator; asserted as string output `"12.50"`. |
 | Deleted SKU reuse confuses API users | Low | 409 message names the possibility explicitly; D9 documented in the README later. |
 | Catalog writes forget cache invalidation in Step 6 | Med | Explicit marker comments at each commit point; Step 6 plan greps for them. |
+
+---
+
+# Implementation Plan: Step 4 — Movement engine
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 4. Spec 1 (no stored stock), 2.1 (race conditions) and 2.2 (atomic batches). Decisions D1–D5 and D8. **All three required tests live here.**
+
+## Overview
+Add the append-only movement ledger, the locking engine that writes IN/OUT/TRANSFER movements without ever overselling, all-or-nothing batches with detailed shortages, stock computed from history, the D8 "stock must be 0" guards, and movement history.
+
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| POST | `/movements` | any user | single line: `{type, sku, quantity, from_warehouse_id?, to_warehouse_id?}` |
+| POST | `/movements/batch` | any user | `{type, from_warehouse_id?, to_warehouse_id?, items: [{sku, quantity}]}` (1..100) |
+| GET | `/movements` | any user | history; filters `product_id`, `warehouse_id` (either side), `type`, `date_from`, `date_to`; paginated, newest first |
+| GET | `/warehouses/{warehouse_id}/stock` | any user | products currently in the warehouse (qty > 0), paginated, one query |
+| GET | `/products/{product_id}` | any user | **extended:** `total_stock` + `stock_by_warehouse` (nonzero only), one query |
+| PATCH | `/warehouses/{id}` | admin | **guarded:** `is_active=false` → 409 `warehouse_not_empty` if it holds stock |
+| DELETE | `/products/{id}` | admin | **guarded:** 409 `product_has_stock` if total stock ≠ 0 |
+
+## Architecture Decisions
+- **Ledger tables** (`src/movements/models.py`, migration `0006`). Append-only, so `created_at` only:
+  - `operation`:
+    - `id` (bigint identity), `type`, `performed_by` → `app_user`, `idempotency_key` (nullable, ≤ 255), `created_at`
+    - `UNIQUE (performed_by, idempotency_key)`, which allows many NULLs. The column and constraint go in now so Step 8 needs no migration; until then the column is always NULL.
+  - `stock_movement`:
+    - `id` (bigint), `operation_id` → `operation`, `type`, `product_id` → `product`, `quantity`, `from_warehouse_id` / `to_warehouse_id` → `warehouse`, `performed_by` → `app_user`, `created_at`
+    - FKs `ON DELETE RESTRICT`: ledger rows never disappear.
+    - CHECK `quantity BETWEEN 1 AND 1000000`.
+    - CHECK `movement_shape`: `(IN ∧ from IS NULL ∧ to NOT NULL) ∨ (OUT ∧ from NOT NULL ∧ to IS NULL) ∨ (TRANSFER ∧ both NOT NULL ∧ from <> to)`. The DB rejects invalid rows even if the service is buggy.
+    - Indexes: `(product_id, from_warehouse_id)`, `(product_id, to_warehouse_id)`, `(from_warehouse_id)`, `(to_warehouse_id)`, `(operation_id)`, `(created_at)`.
+  - `type`: VARCHAR + CHECK (`IN`/`OUT`/`TRANSFER`, as in the spec), like `role`.
+- **Stock = SQL over the ledger** (`src/movements/stock.py`), never stored (D1):
+  - Source warehouse stock for several products in one grouped query:
+    `SUM(qty) FILTER (WHERE to=:w) − SUM(qty) FILTER (WHERE from=:w)`, wrapped in `COALESCE`, `WHERE product_id IN (…) AND :w IN (from, to)`.
+  - Total product stock: `SUM(CASE type WHEN 'IN' THEN qty WHEN 'OUT' THEN −qty ELSE 0 END)`. TRANSFER nets to zero.
+  - "Warehouse holds stock": `EXISTS` over the per-product net stock in that warehouse `HAVING net <> 0`.
+  - Per-warehouse breakdown: a signed `UNION ALL` ledger (to: +q, from: −q) grouped by warehouse and joined with `warehouse`, aggregated with `json_agg`. Product + total + breakdown come from **one** statement (C11).
+- **Engine: one function for single and batch** (D2):
+  - `movements_service.execute(db, user, command)` with `command = {type, from, to, items}`. The single endpoint builds a one-item command.
+  - **Batch allows IN too.** The spec requires OUT/TRANSFER batches; IN reuses the same engine, so there's no extra code path.
+  - Inside one transaction, under **explicit READ COMMITTED** (D4), set on the engine with `isolation_level="READ COMMITTED"`:
+    0. `SET LOCAL lock_timeout = '<LOCK_TIMEOUT_MS>ms'` (default 5000).
+    1. **Warehouses:** `SELECT … WHERE id IN (from, to) ORDER BY id FOR SHARE`.
+       - Missing → 404 `warehouse_not_found`. Inactive → 409 `warehouse_inactive`.
+       - `FOR SHARE` lets movements run concurrently but blocks a concurrent deactivation (`FOR UPDATE`).
+    2. **Products:** `SELECT id, sku FROM product WHERE sku IN (…) AND NOT is_deleted ORDER BY id`, with `FOR UPDATE` for OUT/TRANSFER and `FOR SHARE` for IN.
+       - Missing or deleted SKUs → 404 `products_not_found` with `missing_skus: [...]` (**all** of them).
+       - Why IN needs a lock at all: an FK insert only takes `KEY SHARE`, which doesn't block a soft-delete UPDATE.
+    3. **OUT/TRANSFER:** one grouped stock query for the source warehouse. This is a new statement taken after the lock, so under READ COMMITTED it sees the previous lock holder's committed movements. Collect **every** shortage; if any →
+       `409 {"code":"insufficient_stock", "detail":…, "shortages":[{"sku","requested","available","missing"}]}`.
+       Nothing was written, and the session rolls back on close.
+    4. Insert the `operation` (RETURNING id), then bulk-insert the movements; commit.
+    5. Return `OperationRead {id, type, performed_by, created_at, movements: [...]}` → 201.
+       `# Step 6` (cache invalidation) and `# Step 7` (low-stock crossings: the before-stock is already known from step 3) markers go here.
+  - **Lock order** is always warehouses → products, each in id order.
+    - The D8 guards take a single row each (warehouse `FOR UPDATE`, or product `FOR UPDATE`), then only read the ledger.
+    - So no cycle is possible: deadlock-free by construction.
+  - **Lock timeout / deadlock** (SQLSTATE `55P03` / `40P01`) → `503 {"code":"service_busy"}` + `Retry-After: 1`, instead of a hung or 500 request. `LOCK_TIMEOUT_MS` lives in `MovementsConfig`, so tests can shrink it.
+- **Schemas** (`src/movements/schemas.py`):
+  - The shape is validated by type: IN requires `to` and forbids `from`; OUT the reverse; TRANSFER needs both, and `from ≠ to`.
+  - SKUs are normalized like products and **unique within a batch** (D5: duplicates → 422, so `[A:5, A:5]` can't pass two separate checks).
+  - `quantity` is 1..1,000,000 and `items` is 1..100.
+  - All of this returns 422 in the unified format, before any DB work.
+- **D8 guards** (replacing the Step 3 markers):
+  - `update_warehouse` with `is_active=false` → re-select the warehouse `FOR UPDATE` (`populate_existing`) → if it holds stock, 409 `warehouse_not_empty`.
+  - `soft_delete_product` → re-select the product `FOR UPDATE` → if total stock ≠ 0, 409 `product_has_stock`.
+  - The locks conflict with the movement engine's `FOR SHARE`/`FOR UPDATE`, so a concurrent IN can't slip in between the check and the flag flip.
+- **Roles:** both storekeeper and admin can create movements and read history (spec 2.6).
+- **Out of scope here:** cache invalidation (Step 6), notifications (Step 7), idempotency logic (Step 8), rate limiting (Step 9). Markers only.
+
+## Dependency Graph
+```
+T17 ledger tables (0006) + stock queries + POST /movements (IN only path)
+     + GET /products/{id} stock breakdown + schema validation
+   └── T18 OUT/TRANSFER: product/warehouse locks, shortage check, batch endpoint,
+           lock-timeout → 503                       ← the 3 required tests + timeout test
+          └── T19 D8 guards (warehouse deactivate / product delete) + GET /movements
+```
+
+## Task List
+- [x] Task 17: Ledger + stock queries + IN movements + product stock breakdown + input validation
+- [x] Task 18: Locking engine for OUT/TRANSFER + batch endpoint + lock timeout → 503
+
+### Checkpoint A (after T18): the core of the assignment
+- [x] The 3 required tests are green and stable (5 consecutive full-suite runs)
+- [x] **Mutation check:** with the product `FOR UPDATE` temporarily removed, the race test fails (oversell). Restored afterwards.
+- [x] ruff + mypy clean; alembic round-trip + `alembic check`
+
+- [x] Task 19: D8 guards + `GET /movements` history + `GET /warehouses/{id}/stock`
+- [x] Task 20: Lazy cleanup of old refresh tokens on login (independent; added at review)
+
+### Checkpoint: Step 4 complete
+- [x] `uv run pytest` green (22 existing + 6 new test functions)
+- [x] Compose:
+  - IN → TRANSFER → OUT via curl with the stock breakdown correct
+  - an oversell attempt → 409 with shortages
+  - deactivating a non-empty warehouse → 409
+- [x] Commit (no self-credit); human review, then plan Step 5
+
+## Risks and Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| The race test passes for the wrong reason (requests serialized, not concurrent) | High | Pool size 20 ≥ 10 concurrent requests. No shared test transaction (Step 1 harness). The **mutation check** proves the lock is what prevents overselling. |
+| REPEATABLE READ creeping in (driver/default change) → stale SUM after the lock wait | High | `isolation_level="READ COMMITTED"` set explicitly on the engine, with a comment pointing to D4. |
+| Deadlocks between batches with overlapping SKUs | Med | A single locking statement per table with `ORDER BY id`; fixed warehouse → product order; the D8 guards lock one row. 40P01 maps to 503 as a last resort. |
+| Duplicate SKUs in one batch bypass the shortage check | High | Rejected in the schema (422); a test in T17. |
+| Unknown/deleted SKUs reported one at a time | Low | Compare requested vs locked SKU sets; list all missing; tested. |
+| A long lock wait hangs requests | Med | `SET LOCAL lock_timeout`, plus a deterministic test (hold the row lock in another session → 503). |
+| `json_agg` breakdown returns `null` for a product with no stock | Low | `COALESCE(json_agg(...), '[]')`; asserted. |
+| Ledger grows large → slow SUMs | Low (scale) | Composite indexes; snapshot+delta noted as a trade-off in PLAN.md §4. |

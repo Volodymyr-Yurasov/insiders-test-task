@@ -7,6 +7,11 @@ class ProductNotFound(NotFound):
     DETAIL = "Product not found"
 
 
+class ProductHasStock(Conflict):
+    CODE = ErrorCode.PRODUCT_HAS_STOCK
+    DETAIL = "Product still has stock; write it off before deleting"
+
+
 class SkuTaken(Conflict):
     # SKUs stay reserved after soft delete (D9), so say so: the "missing" product still owns it.
     CODE = ErrorCode.SKU_TAKEN

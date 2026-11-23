@@ -54,3 +54,14 @@ class ProductRead(CustomModel):
     min_stock_level: int
     created_at: datetime
     updated_at: datetime
+
+
+class WarehouseStock(CustomModel):
+    warehouse_id: int
+    location_code: str
+    quantity: int
+
+
+class ProductDetail(ProductRead):
+    total_stock: int
+    stock_by_warehouse: list[WarehouseStock]

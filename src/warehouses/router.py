@@ -8,7 +8,12 @@ from src.pagination import Page, Pagination
 from src.warehouses import service as warehouses_service
 from src.warehouses.dependencies import ValidWarehouse
 from src.warehouses.models import Warehouse
-from src.warehouses.schemas import WarehouseCreate, WarehouseRead, WarehouseUpdate
+from src.warehouses.schemas import (
+    WarehouseCreate,
+    WarehouseRead,
+    WarehouseStockItem,
+    WarehouseUpdate,
+)
 
 # Every route needs a logged-in user; write routes additionally require admin.
 router = APIRouter(prefix="/warehouses", tags=["warehouses"], dependencies=[Depends(current_user)])
@@ -44,6 +49,18 @@ async def get_warehouse(warehouse: ValidWarehouse) -> Warehouse:
     return warehouse
 
 
+@router.get(
+    "/{warehouse_id}/stock",
+    response_model=Page[WarehouseStockItem],
+    summary="Products currently in the warehouse (quantity > 0)",
+    responses={404: {"description": "Warehouse not found"}},
+)
+async def get_warehouse_stock(
+    warehouse: ValidWarehouse, db: DbSession, page: Pagination
+) -> dict[str, Any]:
+    return await warehouses_service.list_stock(db, warehouse.id, page)
+
+
 @router.patch(
     "/{warehouse_id}",
     response_model=WarehouseRead,
@@ -51,7 +68,7 @@ async def get_warehouse(warehouse: ValidWarehouse) -> Warehouse:
     summary="Edit, deactivate or reactivate a warehouse (admin)",
     responses={
         404: {"description": "Warehouse not found"},
-        409: {"description": "Location code already used"},
+        409: {"description": "Location code already used, or deactivating a non-empty warehouse"},
     },
 )
 async def update_warehouse(

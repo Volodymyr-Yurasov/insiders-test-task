@@ -445,3 +445,149 @@
 - [x] `uv run pytest` green; ruff + mypy clean; alembic round-trip + `alembic check`
 - [x] Compose: the seeded admin creates a warehouse + product via curl; a storekeeper reads OK, writes 403
 - [x] Commit (no self-credit); human review, then plan Step 4
+
+---
+---
+
+# Todo — Step 4: Movement engine
+
+## Task 17: Ledger + stock queries + IN movements + product stock breakdown + input validation
+
+**Description:** Create the append-only `operation`/`stock_movement` tables with DB-enforced invariants, the SQL stock functions, and `POST /movements` working end-to-end for IN. Also: the full request validation for all movement types, the warehouse/product locking prelude (shared with OUT/TRANSFER), and the stock breakdown on `GET /products/{product_id}`.
+
+**Acceptance criteria:**
+- [x] Migration `0006`:
+  - CHECKs: `stock_movement_movement_shape_check`, `stock_movement_quantity_range_check`
+  - FKs `RESTRICT`
+  - the planned indexes
+  - `operation (performed_by, idempotency_key)` unique
+  - engine `isolation_level="READ COMMITTED"` explicit
+- [x] `POST /movements` (any user) with IN → 201 `OperationRead`.
+  - unknown or deleted SKU → 404 `products_not_found` with `missing_skus`
+  - unknown warehouse → 404
+  - inactive warehouse → 409 `warehouse_inactive`
+  - wrong shape (IN with `from`, OUT without `from`, TRANSFER `from == to`) → 422
+  - no token → 401
+- [x] `GET /products/{product_id}` returns `total_stock` and `stock_by_warehouse: [{warehouse_id, location_code, quantity}]` (nonzero only; `[]` when none) from one statement.
+
+**Verification:**
+- [x] `tests/movements/test_validation.py::test_movement_validation`:
+  - each rejection above (also via `/movements/batch` with duplicate SKUs → 422) writes **zero** rows
+  - a storekeeper IN → 201
+  - the product breakdown shows that IN
+- [x] Migration round-trip + `alembic check`; ruff + mypy clean; suite green.
+
+**Dependencies:** Step 3
+
+**Files likely touched:** `src/movements/{__init__,constants,config,exceptions,models,schemas,stock,service,router}.py`, `src/models.py`, `src/main.py`, `src/database.py`, `src/products/{router,schemas}.py`, `alembic/versions/2026-11-23_movement_ledger.py`, `tests/movements/{__init__,test_validation}.py`
+
+**Estimated scope:** Large-ish (one new domain package; the slice is the smallest testable one)
+
+---
+
+## Task 18: Locking engine for OUT/TRANSFER + batch endpoint + lock timeout → 503
+
+**Description:** Add the race-safe path:
+- products locked `FOR UPDATE` in id order
+- source stock computed after the lock (READ COMMITTED)
+- all shortages collected, with all-or-nothing rollback
+
+Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
+
+**Acceptance criteria:**
+- [x] OUT/TRANSFER never take stock below zero under concurrency.
+- [x] Insufficient stock → `409 insufficient_stock` listing **every** short SKU (`requested`, `available`, `missing`). Nothing is written.
+- [x] `POST /movements/batch` (1..100 items, types IN/OUT/TRANSFER) uses the same engine. A lock wait longer than `LOCK_TIMEOUT_MS` → `503 service_busy` + `Retry-After`.
+
+**Verification:**
+- [x] `tests/movements/test_engine.py`:
+  1. **`test_concurrent_out_never_oversells`** (required): stock 5, 10× OUT qty 1 via `asyncio.gather` → exactly 5×201 + 5×409, final stock **== 0**.
+  2. **`test_batch_is_all_or_nothing`** (required): A=10, B=2, C=0; batch OUT [A:5, B:3, C:1] → 409 with shortages for B (3/2/1) and C (1/0/1). The movement count is unchanged and A is still 10.
+  3. **`test_stock_after_in_transfer_out`** (required): IN 10 → W1; TRANSFER 4 W1→W2; OUT 3 from W2 → W1=6, W2=1, total=7 (via `GET /products/{id}`).
+  4. `test_lock_timeout_returns_503`: another session holds the product `FOR UPDATE`; with `LOCK_TIMEOUT_MS` patched to 200, OUT → 503 with `Retry-After`.
+- [x] Full suite 5× green; mutation check (remove `FOR UPDATE` → test 1 fails), then restore.
+- [x] ruff + mypy clean.
+
+**Dependencies:** Task 17
+
+**Files likely touched:** `src/movements/{service,stock,router,schemas,exceptions}.py`, `src/exceptions.py` (503 class), `tests/movements/test_engine.py`
+
+**Estimated scope:** Medium
+
+---
+
+## Checkpoint A (after Task 18)
+- [x] The 3 required tests green and stable; mutation check proves the lock matters
+- [x] ruff + mypy clean; alembic round-trip + `alembic check`
+
+---
+
+## Task 19: D8 guards + `GET /movements` history
+
+**Description:**
+- Block deactivating a warehouse that still holds stock, and soft-deleting a product with non-zero total stock. Both run under row locks that conflict with the engine.
+- Expose movement history with filters.
+- Expose what a warehouse currently holds.
+
+**Acceptance criteria:**
+- [x] `PATCH /warehouses/{id}` with `is_active=false` → 409 `warehouse_not_empty` while any product has nonzero stock there. Reactivating, and other edits, are unaffected.
+- [x] `DELETE /products/{id}` → 409 `product_has_stock` while total stock ≠ 0. After the stock is moved out, both succeed.
+- [x] `GET /movements` (any user):
+  - paginated, ordered `created_at DESC, id DESC`
+  - filters: `product_id`, `warehouse_id` (from or to), `type`, `date_from` / `date_to` (`date_to` is exclusive)
+  - each row includes the SKU
+- [x] `GET /warehouses/{warehouse_id}/stock` (any user):
+  - paginated `{product_id, sku, name, quantity}` for products with quantity > 0
+  - one grouped query over the ledger, ordered by SKU
+  - unknown warehouse → 404
+
+**Verification:**
+- [x] `tests/movements/test_guards.py::test_stock_guards`:
+  - deactivate a non-empty warehouse → 409, delete a product with stock → 409
+  - OUT everything → both → 200 / 204
+- [x] `test_stock_after_in_transfer_out` also asserts:
+  - `GET /movements?product_id=` returns the 3 movements newest first, and `warehouse_id=W2` returns 2
+  - `GET /warehouses/{W1}/stock` → that product with 6, and `W2` → 1
+- [x] ruff + mypy clean; suite green.
+
+**Dependencies:** Task 18
+
+**Files likely touched:** `src/warehouses/service.py`, `src/warehouses/exceptions.py`, `src/products/service.py`, `src/products/exceptions.py`, `src/movements/{router,service,schemas}.py`, `tests/movements/{test_guards,test_engine}.py`
+
+**Estimated scope:** Medium
+
+---
+
+---
+
+## Task 20: Lazy cleanup of old refresh tokens
+
+**Description:** Keep `refresh_token` from growing forever without adding a scheduler. Each login deletes a bounded batch of tokens that expired more than `REFRESH_TOKEN_RETENTION_DAYS` (default 7) ago.
+
+**Acceptance criteria:**
+- [x] Migration `0007`: index `refresh_token_expires_at_idx`.
+- [x] On login, before the new token is issued:
+  - `DELETE FROM refresh_token WHERE id IN (SELECT id … WHERE expires_at < now() - retention LIMIT 1000)`
+  - global, not per user; bounded, so a backlog can never make one login slow
+  - concurrent logins deleting the same rows are harmless
+- [x] Tokens that are expired or revoked **within** the retention window are kept, so reuse of a recently rotated or expired token is still recognized as theft.
+
+**Verification:**
+- [x] `tests/auth/test_service.py::test_login_prunes_old_refresh_tokens`: insert one token expired 30 days ago and one expired 1 day ago; log in → the 30-day one is gone, the 1-day one and the new one remain.
+- [x] Migration round-trip + `alembic check`; suite green.
+
+**Dependencies:** none (independent of Tasks 17–19)
+
+**Files likely touched:** `src/auth/{config,models,service}.py`, `alembic/versions/2026-11-23_refresh_token_expires_at_idx.py`, `tests/auth/test_service.py`
+
+**Estimated scope:** Small
+
+---
+
+## Checkpoint: Step 4 complete
+- [x] `uv run pytest` green; ruff + mypy clean; alembic round-trip + `alembic check`
+- [x] Compose:
+  - IN → TRANSFER → OUT via curl with the breakdown correct
+  - oversell → 409 with shortages
+  - deactivating a non-empty warehouse → 409
+- [x] Commit (no self-credit); human review, then plan Step 5

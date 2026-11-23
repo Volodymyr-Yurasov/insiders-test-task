@@ -55,6 +55,14 @@ class Conflict(DetailedHTTPException):
     DETAIL = "Conflict"
 
 
+class ServiceBusy(DetailedHTTPException):
+    # Lock wait timed out or a deadlock was broken: safe to retry shortly.
+    STATUS_CODE = status.HTTP_503_SERVICE_UNAVAILABLE
+    CODE: ClassVar[str] = ErrorCode.SERVICE_BUSY
+    DETAIL = "The resource is busy, please retry"
+    HEADERS: ClassVar[dict[str, str] | None] = {"Retry-After": "1"}
+
+
 def _error(
     status_code: int,
     code: str,

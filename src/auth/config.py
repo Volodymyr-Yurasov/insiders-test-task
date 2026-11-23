@@ -10,6 +10,9 @@ class AuthConfig(BaseSettings):
     JWT_ALG: str = "HS256"
     JWT_ACCESS_EXP_MINUTES: int = 15
     JWT_REFRESH_EXP_DAYS: int = 14
+    # Expired refresh tokens are kept this long (reuse detection) and then pruned lazily on login.
+    REFRESH_TOKEN_RETENTION_DAYS: int = Field(default=7, ge=0)
+    REFRESH_TOKEN_PRUNE_BATCH: int = Field(default=1000, ge=1)
 
     # Optional first-admin seed (both must be set; empty values mean "skip").
     FIRST_ADMIN_USERNAME: str | None = None

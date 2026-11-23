@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.schemas import CustomModel
 
 T = TypeVar("T")
+# SQLAlchemy 2.1's Select is variadic-generic over its column types.
+AnySelect = Select[*tuple[Any, ...]]
 
 
 class PageParams(CustomModel):
@@ -38,14 +40,23 @@ class Page(CustomModel, Generic[T]):
     offset: int
 
 
-async def paginate(db: AsyncSession, stmt: Select[Any], params: PageParams) -> dict[str, Any]:
+async def paginate(db: AsyncSession, stmt: AnySelect, params: PageParams) -> dict[str, Any]:
     """Run `stmt` (already filtered and ORDERED with a unique tie-breaker) for one page.
 
-    Returns a dict matching `Page[...]`; items are whatever the statement's first column
-    yields (ORM entities for `select(Model)`), so the route's response_model validates them.
+    Returns a dict matching `Page[...]`. Items are ORM entities for `select(Model)`, or
+    dicts keyed by column label for multi-column selects; the route's response_model
+    validates either.
     """
+    # column_descriptions counts entities (select(Model) -> 1), unlike selected_columns.
+    single_entity = len(stmt.column_descriptions) == 1
     windowed = stmt.add_columns(func.count().over().label("_total"))
     rows = (await db.execute(windowed.limit(params.limit).offset(params.offset))).all()
+    items = [
+        row[0]
+        if single_entity
+        else {key: value for key, value in row._mapping.items() if key != "_total"}
+        for row in rows
+    ]
     if rows:
         total = rows[0]._total
     elif params.offset == 0:
@@ -54,7 +65,7 @@ async def paginate(db: AsyncSession, stmt: Select[Any], params: PageParams) -> d
         # Past the end: no row to carry the window count, so count separately (rare path).
         total = await db.scalar(select(func.count()).select_from(stmt.order_by(None).subquery()))
     return {
-        "items": [row[0] for row in rows],
+        "items": items,
         "total": total,
         "limit": params.limit,
         "offset": params.offset,

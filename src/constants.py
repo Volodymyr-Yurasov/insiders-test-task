@@ -22,3 +22,4 @@ class ErrorCode(StrEnum):
     PERMISSION_DENIED = "permission_denied"
     NOT_FOUND = "not_found"
     CONFLICT = "conflict"
+    SERVICE_BUSY = "service_busy"

@@ -33,6 +33,7 @@ os.environ["JWT_SECRET"] = "test-secret-not-for-production-0123456789abcdef"
 
 import asyncio  # noqa: E402
 from collections.abc import AsyncIterator, Awaitable, Callable  # noqa: E402
+from decimal import Decimal  # noqa: E402
 from uuid import uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
@@ -41,7 +42,7 @@ from alembic import command  # noqa: E402
 from alembic.config import Config as AlembicConfig  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy import text  # noqa: E402
+from sqlalchemy import func, select, text  # noqa: E402
 
 from src.auth import service as auth_service  # noqa: E402
 from src.auth import utils as auth_utils  # noqa: E402
@@ -49,6 +50,13 @@ from src.auth.constants import Role  # noqa: E402
 from src.auth.models import AppUser  # noqa: E402
 from src.main import create_app  # noqa: E402
 from src.models import Base  # noqa: E402
+from src.movements.models import StockMovement  # noqa: E402
+from src.products import service as products_service  # noqa: E402
+from src.products.models import Product  # noqa: E402
+from src.products.schemas import ProductCreate  # noqa: E402
+from src.warehouses import service as warehouses_service  # noqa: E402
+from src.warehouses.models import Warehouse  # noqa: E402
+from src.warehouses.schemas import WarehouseCreate  # noqa: E402
 
 
 async def _ensure_database() -> None:
@@ -152,3 +160,46 @@ def admin_headers(admin: AppUser) -> dict[str, str]:
 @pytest.fixture
 def storekeeper_headers(storekeeper: AppUser) -> dict[str, str]:
     return auth_headers(storekeeper)
+
+
+# --- Catalog fixtures (created through services: fast, no HTTP/auth overhead).
+
+MakeWarehouse = Callable[..., Awaitable[Warehouse]]
+MakeProduct = Callable[..., Awaitable[Product]]
+
+
+@pytest.fixture
+def make_warehouse(app: FastAPI) -> MakeWarehouse:
+    async def _make(code: str | None = None, *, is_active: bool = True) -> Warehouse:
+        code = code or f"W-{uuid4().hex[:6]}"
+        data = WarehouseCreate(name=code, location_code=code, address="Test st. 1")
+        async with app.state.session_factory() as db:
+            warehouse = await warehouses_service.create_warehouse(db, data)
+            if not is_active:
+                warehouse.is_active = False
+                await db.commit()
+        return warehouse
+
+    return _make
+
+
+@pytest.fixture
+def make_product(app: FastAPI) -> MakeProduct:
+    async def _make(
+        sku: str | None = None, *, price: str = "10.00", min_stock_level: int = 0
+    ) -> Product:
+        data = ProductCreate(
+            sku=sku or f"P-{uuid4().hex[:6]}",
+            name="Test product",
+            base_price=Decimal(price),
+            min_stock_level=min_stock_level,
+        )
+        async with app.state.session_factory() as db:
+            return await products_service.create_product(db, data)
+
+    return _make
+
+
+async def count_movements(app: FastAPI) -> int:
+    async with app.state.session_factory() as db:
+        return await db.scalar(select(func.count()).select_from(StockMovement)) or 0

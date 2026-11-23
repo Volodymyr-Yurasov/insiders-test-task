@@ -50,6 +50,10 @@ def create_engine(config: Config) -> AsyncEngine:
         pool_size=config.DB_POOL_SIZE,
         max_overflow=config.DB_MAX_OVERFLOW,
         pool_pre_ping=True,
+        # Explicit on purpose (D4): the movement engine relies on each statement taking a
+        # fresh snapshot, so the stock SUM run *after* acquiring a row lock sees what the
+        # previous lock holder committed. Under REPEATABLE READ it would not (oversell).
+        isolation_level="READ COMMITTED",
     )
 
 

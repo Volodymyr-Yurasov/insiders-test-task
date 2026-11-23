@@ -5,6 +5,7 @@ unimported model is invisible and autogenerate would propose dropping its table.
 """
 
 import src.auth.models
+import src.movements.models
 import src.products.models
 import src.warehouses.models  # noqa: F401
 from src.database import Base

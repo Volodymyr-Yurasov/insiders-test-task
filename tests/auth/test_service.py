@@ -1,7 +1,10 @@
 import asyncio
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import pytest
 from fastapi import FastAPI
+from httpx import AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import select, update
 
@@ -9,9 +12,9 @@ from src.auth import service as auth_service
 from src.auth.config import auth_settings
 from src.auth.constants import Role
 from src.auth.exceptions import LastAdmin
-from src.auth.models import AppUser
+from src.auth.models import AppUser, RefreshToken
 from src.auth.schemas import UserUpdate
-from tests.conftest import CreateUser
+from tests.conftest import TEST_PASSWORD, CreateUser
 
 
 async def test_last_admin_guard_waits_for_inflight_demotion(
@@ -65,3 +68,30 @@ async def test_seed_first_admin_is_idempotent(
         assert [(a.username, a.role) for a in admins] == [("root", Role.ADMIN)]
         assert await auth_service.authenticate(db, "root", "original-pass") is not None
         assert await auth_service.authenticate(db, "root", "changed-pass") is None
+
+
+async def test_login_prunes_old_refresh_tokens(
+    app: FastAPI, client: AsyncClient, create_user: CreateUser
+) -> None:
+    user = await create_user(username="pruner")
+    now = datetime.now(UTC)
+    async with app.state.session_factory() as db:
+        for label, age_days in (("ancient", 30), ("recent", 1)):
+            db.add(
+                RefreshToken(
+                    user_id=user.id,
+                    family_id=uuid.uuid4(),
+                    token_hash=label.ljust(64, "0"),
+                    expires_at=now - timedelta(days=age_days),
+                )
+            )
+        await db.commit()
+
+    login = await client.post("/auth/token", data={"username": "pruner", "password": TEST_PASSWORD})
+    assert login.status_code == 200
+
+    async with app.state.session_factory() as db:
+        hashes = set(await db.scalars(select(RefreshToken.token_hash)))
+    assert "ancient".ljust(64, "0") not in hashes, "expired beyond retention -> pruned"
+    assert "recent".ljust(64, "0") in hashes, "inside retention -> kept for reuse detection"
+    assert len(hashes) == 2, "the recent one + the token just issued"

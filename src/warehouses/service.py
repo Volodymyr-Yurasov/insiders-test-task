@@ -5,8 +5,11 @@ from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from src.movements import stock as movements_stock
+from src.movements.models import StockMovement
 from src.pagination import PageParams, paginate
-from src.warehouses.exceptions import LocationCodeTaken
+from src.products.models import Product
+from src.warehouses.exceptions import LocationCodeTaken, WarehouseNotEmpty
 from src.warehouses.models import Warehouse
 from src.warehouses.schemas import WarehouseCreate, WarehouseUpdate
 
@@ -40,7 +43,17 @@ async def list_warehouses(
 async def update_warehouse(
     db: AsyncSession, warehouse: Warehouse, changes: WarehouseUpdate
 ) -> Warehouse:
-    # Step 4 adds the D8 guard here: deactivation only when the warehouse holds no stock.
+    if changes.is_active is False:
+        # D8: lock the row (conflicts with the movement engine's FOR SHARE, so no movement
+        # can land in between), re-read it, then require the warehouse to be empty.
+        await db.scalar(
+            select(Warehouse)
+            .where(Warehouse.id == warehouse.id)
+            .with_for_update()
+            .execution_options(populate_existing=True)
+        )
+        if await movements_stock.warehouse_holds_stock(db, warehouse.id):
+            raise WarehouseNotEmpty()
     for field, value in changes.changes().items():
         setattr(warehouse, field, value)
     try:
@@ -50,3 +63,21 @@ async def update_warehouse(
         await db.rollback()
         raise LocationCodeTaken() from exc
     return warehouse
+
+
+async def list_stock(db: AsyncSession, warehouse_id: int, page: PageParams) -> dict[str, Any]:
+    """Products currently in the warehouse (quantity > 0), from one grouped ledger query."""
+    quantity = movements_stock.net_in_warehouse(warehouse_id)
+    per_product = (
+        select(StockMovement.product_id, quantity.label("quantity"))
+        .where(movements_stock.touches_warehouse(warehouse_id))
+        .group_by(StockMovement.product_id)
+        .having(quantity > 0)
+        .subquery("per_product")
+    )
+    stmt = (
+        select(Product.id.label("product_id"), Product.sku, Product.name, per_product.c.quantity)
+        .join(per_product, per_product.c.product_id == Product.id)
+        .order_by(Product.sku, Product.id)
+    )
+    return await paginate(db, stmt, page)

@@ -7,7 +7,7 @@ from src.database import DbSession
 from src.products import service as products_service
 from src.products.dependencies import ValidProduct
 from src.products.models import Product
-from src.products.schemas import ProductCreate, ProductRead, ProductUpdate
+from src.products.schemas import ProductCreate, ProductDetail, ProductRead, ProductUpdate
 
 # Every route needs a logged-in user; write routes additionally require admin.
 router = APIRouter(prefix="/products", tags=["products"], dependencies=[Depends(current_user)])
@@ -30,10 +30,14 @@ async def create_product(body: ProductCreate, db: DbSession) -> Product:
 
 
 @router.get(
-    "/{product_id}", response_model=ProductRead, summary="Get a product", responses=NOT_FOUND
+    "/{product_id}",
+    response_model=ProductDetail,
+    summary="Get a product with its total and per-warehouse stock",
+    responses=NOT_FOUND,
 )
-async def get_product(product: ValidProduct) -> Product:
-    return product
+async def get_product(product_id: int, db: DbSession) -> ProductDetail:
+    # No ValidProduct dependency: the detail query itself 404s, keeping this ONE statement.
+    return await products_service.get_product_detail(db, product_id)
 
 
 @router.patch(

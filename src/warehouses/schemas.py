@@ -33,6 +33,13 @@ class WarehouseUpdate(PatchModel):
     is_active: bool | None = None
 
 
+class WarehouseStockItem(CustomModel):
+    product_id: int
+    sku: str
+    name: str
+    quantity: int
+
+
 class WarehouseRead(CustomModel):
     id: int
     name: str
