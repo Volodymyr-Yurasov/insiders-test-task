@@ -44,28 +44,39 @@ class Decision:
     limit: int
     remaining: int
     retry_after_s: int = 0
+    # The ZSET member recorded for this request (None if denied or Redis was down);
+    # lets a request that turns out to write nothing give its slot back.
+    member: str | None = None
 
 
 async def hit(redis: Redis, user_id: int) -> Decision:
     """Record one transaction attempt for the user if within the limit."""
     limit = rate_limit_settings.RATE_LIMIT_MAX_REQUESTS
     window_ms = int(rate_limit_settings.RATE_LIMIT_WINDOW_S * 1000)
+    member = uuid.uuid4().hex  # unique: two requests in the same millisecond still count twice
     try:
         allowed, remaining, retry_after_ms = await redis.eval(
-            _SLIDING_WINDOW,
-            1,
-            f"rl:{user_id}",
-            limit,
-            window_ms,
-            uuid.uuid4().hex,  # unique: two requests in the same millisecond still count twice
+            _SLIDING_WINDOW, 1, _key(user_id), limit, window_ms, member
         )
     except RedisError:
         # Fail open: stock operations matter more than the limiter being available.
         logger.error("rate limiter unavailable; allowing the request", exc_info=True)
         return Decision(allowed=True, limit=limit, remaining=limit)
-    return Decision(
-        allowed=bool(allowed),
-        limit=limit,
-        remaining=int(remaining),
-        retry_after_s=max(1, math.ceil(int(retry_after_ms) / 1000)) if not allowed else 0,
-    )
+    if not allowed:
+        retry_after_s = max(1, math.ceil(int(retry_after_ms) / 1000))
+        return Decision(False, limit, 0, retry_after_s)
+    return Decision(True, limit, int(remaining), member=member)
+
+
+async def refund(redis: Redis, user_id: int, decision: Decision) -> None:
+    """Give back the slot of a request that turned out to write nothing (idempotent replay)."""
+    if decision.member is None:
+        return
+    try:
+        await redis.zrem(_key(user_id), decision.member)
+    except RedisError:
+        logger.warning("could not refund rate-limit slot", exc_info=True)
+
+
+def _key(user_id: int) -> str:
+    return f"rl:{user_id}"

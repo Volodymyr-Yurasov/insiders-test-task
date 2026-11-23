@@ -33,7 +33,7 @@ The tests run against the real Postgres and Redis from compose. They use a separ
 ```bash
 docker compose up -d db redis
 uv sync
-uv run pytest               # 46 tests, ~25 s
+uv run pytest               # 49 tests, ~25 s
 uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 uv run alembic check        # models and migrations in sync
 ```
@@ -139,6 +139,7 @@ The lock order (warehouses → products, by id) rules out deadlocks. A lock wait
 - **Stock is summed over the full history.** It's indexed and measured fast at 300k rows. At very large scale, periodic snapshots plus deltas would be the next step.
 - **Valuation uses the current base price,** as the spec says, not historical cost.
 - **`BackgroundTasks` is best-effort:** a task is lost if the worker dies after responding. In production, an outbox row plus a queue worker would make it durable.
+- **Idempotency keys are reserved permanently, not for 24 h.** Redis replays a result for 24 h, but the Postgres unique constraint that guarantees exactly-once never expires. Reusing a key later with a *different* request returns `422 idempotency_key_reused`. Clients should use a fresh unique key (e.g. a UUID) per logical operation, which is the usual contract (Stripe works the same way). It's safer than letting an old key silently start a new write-off.
 - **Strict refresh rotation:** a client that retries a refresh almost simultaneously (e.g. a double-click) trips reuse detection and must log in again. A short grace window is a possible extension.
 
 ## Configuration

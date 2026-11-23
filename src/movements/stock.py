@@ -2,7 +2,7 @@
 
 from collections.abc import Collection
 
-from sqlalchemy import ColumnElement, Integer, Subquery, case, exists, func, or_, select
+from sqlalchemy import BigInteger, ColumnElement, Subquery, case, exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.movements.constants import MovementType
@@ -13,7 +13,8 @@ def net_in_warehouse(warehouse_id: int) -> ColumnElement[int]:
     """Aggregate: arrivals into the warehouse minus departures from it."""
     inbound = func.coalesce(func.sum(SM.quantity).filter(SM.to_warehouse_id == warehouse_id), 0)
     outbound = func.coalesce(func.sum(SM.quantity).filter(SM.from_warehouse_id == warehouse_id), 0)
-    return (inbound - outbound).cast(Integer)
+    # BIGINT, like the SUM itself: a 32-bit cast would overflow past ~2.1 billion units.
+    return (inbound - outbound).cast(BigInteger)
 
 
 def touches_warehouse(warehouse_id: int) -> ColumnElement[bool]:
@@ -28,7 +29,7 @@ def signed_total() -> ColumnElement[int]:
         (SM.type == MovementType.OUT, -SM.quantity),
         else_=0,
     )
-    return func.coalesce(func.sum(signed), 0).cast(Integer)
+    return func.coalesce(func.sum(signed), 0).cast(BigInteger)
 
 
 def signed_ledger() -> Subquery:

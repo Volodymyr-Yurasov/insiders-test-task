@@ -7,9 +7,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src.movements.models import StockMovement as SM
 from src.products.models import Product
 from src.reports.schemas import ValuationReport, WarehouseValuation
+from src.schemas import CENTS
 from src.warehouses.models import Warehouse
-
-_CENTS = Decimal("0.01")
 
 
 def valuation_query() -> Select[int, str, str, bool, int, Decimal]:
@@ -57,7 +56,7 @@ async def compute_valuation(db: AsyncSession) -> ValuationReport:
         )
         for warehouse_id, name, location_code, is_active, units, value in rows
     ]
-    grand_total = sum((w.total_value for w in warehouses), Decimal(0)).quantize(_CENTS)
+    grand_total = sum((w.total_value for w in warehouses), Decimal(0)).quantize(CENTS)
     return ValuationReport(
         warehouses=warehouses, grand_total=grand_total, generated_at=datetime.now(UTC)
     )

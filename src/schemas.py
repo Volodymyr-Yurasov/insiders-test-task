@@ -1,6 +1,17 @@
-from typing import Any, Self
+from decimal import Decimal
+from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, model_validator
+from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+
+CENTS = Decimal("0.01")
+
+# Human-readable names: trimmed, non-empty.
+Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
+
+
+def strip_upper(value: object) -> object:
+    """BeforeValidator for codes (SKU, location code): ' ab-1 ' -> 'AB-1'."""
+    return value.strip().upper() if isinstance(value, str) else value
 
 
 class CustomModel(BaseModel):

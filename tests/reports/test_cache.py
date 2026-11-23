@@ -149,3 +149,34 @@ async def test_cold_cache_stampede_computes_once(
     assert Counter(r.headers["x-cache"] for r in responses) == {"MISS": 1, "HIT": 9}
     assert sum(VALUATION_SQL_MARK in s for s in statements) == 1
     assert len({r.json()["generated_at"] for r in responses}) == 1
+
+
+async def test_redis_failure_after_compute_does_not_recompute() -> None:
+    """Redis dies between computing and storing: answer once, never run the query twice."""
+    from redis.exceptions import ConnectionError as RedisConnectionError
+
+    from src.reports.schemas import ValuationReport
+
+    class FlakyRedis:
+        async def get(self, key: str) -> None:
+            return None
+
+        async def set(self, key: str, value: str, **kwargs: Any) -> bool:
+            if kwargs.get("nx"):
+                return True  # we win the recompute lock
+            raise RedisConnectionError("gone while storing")
+
+        async def eval(self, *args: Any) -> int:
+            raise RedisConnectionError("gone while releasing")
+
+    calls = 0
+
+    async def compute() -> ValuationReport:
+        nonlocal calls
+        calls += 1
+        return ValuationReport(
+            warehouses=[], grand_total="0.00", generated_at="2026-01-01T00:00:00Z"
+        )
+
+    report, status = await cache.get_or_compute(FlakyRedis(), compute)  # type: ignore[arg-type]
+    assert (calls, status, str(report.grand_total)) == (1, "MISS", "0.00")

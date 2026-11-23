@@ -70,12 +70,21 @@ async def begin(redis: Redis, user_id: int, key: str, request_fp: str) -> Procee
             raw = await redis.get(redis_key)
             if raw is None:
                 continue
-            existing = json.loads(raw)
-            if existing["fp"] != request_fp:
+            try:
+                existing = json.loads(raw)
+                stored_fp, state = existing["fp"], existing["state"]
+                replay = (
+                    Replay(existing["status_code"], existing["body"]) if state == "done" else None
+                )
+            except (ValueError, KeyError, TypeError):
+                # Corrupt or foreign record: don't 500, let the DB constraint decide.
+                logger.warning("unreadable idempotency record for %s; using the DB", redis_key)
+                return Proceed(None)
+            if stored_fp != request_fp:
                 raise IdempotencyKeyReused()
-            if existing["state"] == "processing":
+            if replay is None:
                 raise IdempotencyInProgress()
-            return Replay(existing["status_code"], existing["body"])
+            return replay
     except RedisError:
         logger.warning("idempotency cache unavailable; relying on the DB constraint", exc_info=True)
     return Proceed(None)

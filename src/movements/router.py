@@ -143,6 +143,20 @@ def _replayed(status_code: int, body: dict[str, Any]) -> JSONResponse:
     return JSONResponse(body, status_code=status_code, headers={REPLAYED_HEADER: "true"})
 
 
+@dataclass(frozen=True)
+class _Claim:
+    """This request owns the Redis idempotency marker for `key`."""
+
+    key: str
+    fingerprint: str
+    token: str
+
+
+async def _release(ctx: _WriteContext, claim: _Claim | None) -> None:
+    if claim is not None:
+        await idempotency_service.release(ctx.redis, ctx.user_id, claim.key, claim.token)
+
+
 async def _record(
     ctx: _WriteContext,
     endpoint: str,
@@ -155,38 +169,42 @@ async def _record(
     cache nor notifies, and its idempotency marker is released for a real retry.
     """
     key = ctx.idempotency_key
-    request_fp = idempotency_service.fingerprint(endpoint, body) if key else None
-    token: str | None = None
-    if key is not None and request_fp is not None:
+    request_fp: str | None = None
+    claim: _Claim | None = None  # set only while this request holds the Redis marker
+    if key is not None:
+        request_fp = idempotency_service.fingerprint(endpoint, body)
         decision = await idempotency_service.begin(ctx.redis, ctx.user_id, key, request_fp)
         if isinstance(decision, idempotency_service.Replay):
             return _replayed(decision.status_code, decision.body)
-        token = decision.token
+        if decision.token is not None:
+            claim = _Claim(key, request_fp, decision.token)
 
     # Rate limit AFTER the replay check (replays write nothing and cost no quota) and BEFORE
     # the engine (failed business attempts still count: the limit protects the system).
     limit = await rate_limit_service.hit(ctx.redis, ctx.user_id)
     if not limit.allowed:
-        if key is not None and token is not None:
-            await idempotency_service.release(ctx.redis, ctx.user_id, key, token)
+        await _release(ctx, claim)
         raise RateLimited(limit.retry_after_s)
-    ctx.response.headers["X-RateLimit-Limit"] = str(limit.limit)
-    ctx.response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
 
     try:
         result = await movements_service.execute(ctx.db, ctx.user_id, build(key, request_fp))
-    except Exception:
-        if key is not None and token is not None:
-            await idempotency_service.release(ctx.redis, ctx.user_id, key, token)
+    except BaseException:  # incl. CancelledError (client gone): never strand the marker
+        await _release(ctx, claim)
         raise
 
     payload = result.operation.model_dump(mode="json")
-    if key is not None and request_fp is not None and token is not None:
+    if claim is not None:
         await idempotency_service.complete(
-            ctx.redis, ctx.user_id, key, request_fp, status.HTTP_201_CREATED, payload
+            ctx.redis, ctx.user_id, claim.key, claim.fingerprint, status.HTTP_201_CREATED, payload
         )
-    if result.replayed:  # the DB already had this key's operation: nothing new was written
+    if result.replayed:
+        # The DB already had this key's operation (Redis record expired or unavailable):
+        # nothing was written, so the attempt gives its rate-limit slot back.
+        await rate_limit_service.refund(ctx.redis, ctx.user_id, limit)
         return _replayed(status.HTTP_201_CREATED, payload)
+
+    ctx.response.headers["X-RateLimit-Limit"] = str(limit.limit)
+    ctx.response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
 
     await ctx.valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
     if result.low_stock:

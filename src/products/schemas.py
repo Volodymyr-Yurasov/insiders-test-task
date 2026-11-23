@@ -11,28 +11,20 @@ from pydantic import (
     model_validator,
 )
 
-from src.schemas import CustomModel, PatchModel
-
-
-def _normalize_sku(value: object) -> object:
-    return value.strip().upper() if isinstance(value, str) else value
-
+from src.schemas import CENTS, CustomModel, Name, PatchModel, strip_upper
 
 Sku = Annotated[
     str,
-    BeforeValidator(_normalize_sku),
+    BeforeValidator(strip_upper),
     StringConstraints(pattern=r"^[A-Z0-9][A-Z0-9._-]{0,63}$"),
 ]
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
-_CENTS = Decimal("0.01")
-
 # Exact money: Decimal in, Numeric(12,2) in the DB, a JSON string out (D10). Quantized after
 # validation so the value the ORM holds (and echoes back) is always "15.00", never "15",
 # matching what the DB returns on read.
 Price = Annotated[
     Decimal,
     Field(ge=0, max_digits=12, decimal_places=2),
-    AfterValidator(lambda price: price.quantize(_CENTS)),
+    AfterValidator(lambda price: price.quantize(CENTS)),
 ]
 MinStockLevel = Annotated[int, Field(ge=0, le=1_000_000_000)]
 

@@ -3,19 +3,13 @@ from typing import Annotated
 
 from pydantic import BeforeValidator, StringConstraints
 
-from src.schemas import CustomModel, PatchModel
-
-
-def _normalize_code(value: object) -> object:
-    return value.strip().upper() if isinstance(value, str) else value
-
+from src.schemas import CustomModel, Name, PatchModel, strip_upper
 
 LocationCode = Annotated[
     str,
-    BeforeValidator(_normalize_code),
+    BeforeValidator(strip_upper),
     StringConstraints(pattern=r"^[A-Z0-9][A-Z0-9_-]{0,31}$"),
 ]
-Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]
 Address = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=500)]
 
 

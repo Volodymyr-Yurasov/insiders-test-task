@@ -172,3 +172,22 @@ async def test_db_backstop_when_redis_is_down(
     assert await _operations_with_key(app, "no-redis") == 1
     assert await _operations_with_key(app, "no-redis-race") == 1
     assert await _stock(client, storekeeper_headers, product_id) == 7
+
+
+async def test_corrupt_redis_record_falls_back_to_the_db(
+    app: FastAPI,
+    client: AsyncClient,
+    storekeeper: Any,
+    storekeeper_headers: dict[str, str],
+    stocked: tuple[int, int, str],
+) -> None:
+    warehouse_id, product_id, sku = stocked
+    await app.state.redis.set(f"idem:{storekeeper.id}:garbled", "not json at all")
+    headers = {**storekeeper_headers, "Idempotency-Key": "garbled"}
+
+    first = await client.post("/movements", json=_out(sku, 1, warehouse_id), headers=headers)
+    retry = await client.post("/movements", json=_out(sku, 1, warehouse_id), headers=headers)
+
+    assert first.status_code == retry.status_code == 201  # no 500
+    assert retry.headers[REPLAYED] == "true"  # the DB constraint still deduplicated
+    assert await _stock(client, storekeeper_headers, product_id) == 9

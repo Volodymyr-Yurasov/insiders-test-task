@@ -116,3 +116,24 @@ async def test_fail_open_when_redis_is_down(
         app.state.redis = real
         await broken.aclose()
     assert statuses == [201, 201, 201]
+
+
+async def test_db_replay_refunds_its_slot(
+    app: FastAPI,
+    storekeeper: Any,
+    storekeeper_headers: dict[str, str],
+    stock_in: Any,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A retry whose 24 h Redis record expired is replayed from Postgres: it wrote nothing,
+    so it must not use up quota (same as a Redis replay)."""
+    monkeypatch.setattr(rate_limit_settings, "RATE_LIMIT_MAX_REQUESTS", 2)
+    h = storekeeper_headers
+
+    assert (await stock_in(h, key="old-key")).status_code == 201  # slot 1
+    await app.state.redis.delete(f"idem:{storekeeper.id}:old-key")  # record "expired"
+    replay = await stock_in(h, key="old-key")
+    assert replay.status_code == 201 and replay.headers["idempotent-replayed"] == "true"
+
+    assert (await stock_in(h)).status_code == 201, "the replay must have refunded its slot"
+    assert (await stock_in(h)).status_code == 429
