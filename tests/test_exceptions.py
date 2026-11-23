@@ -39,3 +39,25 @@ async def test_unhandled_exception_is_opaque() -> None:
         "code": "internal_error",
         "detail": "Internal server error",
     }
+
+
+async def test_out_of_range_ids_are_422_not_500(
+    client: AsyncClient, admin_headers: dict[str, str]
+) -> None:
+    huge = 3_000_000_000  # > int32: asyncpg would refuse to encode it
+    requests = [
+        ("GET", f"/warehouses/{huge}", None),
+        ("GET", f"/products/{huge}", None),
+        ("GET", f"/users/{huge}", None),
+        ("GET", f"/products?warehouse_id={huge}", None),
+        ("GET", f"/movements?product_id={huge}", None),
+        ("GET", "/products?offset=99999999999999999999", None),
+        (
+            "POST",
+            "/movements",
+            {"type": "OUT", "sku": "X", "quantity": 1, "from_warehouse_id": huge},
+        ),
+    ]
+    for method, path, body in requests:
+        r = await client.request(method, path, json=body, headers=admin_headers)
+        assert r.status_code == 422, (path, r.status_code)

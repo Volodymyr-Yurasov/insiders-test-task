@@ -162,11 +162,22 @@ async def create_product(db: AsyncSession, data: ProductCreate) -> Product:
 
 
 async def update_product(db: AsyncSession, product: Product, changes: ProductUpdate) -> Product:
+    # Re-read under a lock: `product` was loaded by the dependency without one, so a soft
+    # delete may have committed since. FOR NO KEY UPDATE serializes with soft_delete_product
+    # (FOR UPDATE) and the movement engine, without blocking FK inserts.
+    current = await db.scalar(
+        select(Product)
+        .where(Product.id == product.id)
+        .with_for_update(key_share=True)
+        .execution_options(populate_existing=True)
+    )
+    if current is None or current.is_deleted:
+        raise ProductNotFound()
     # No unique column is editable (SKU is immutable), so no IntegrityError path here.
     for field, value in changes.changes().items():
-        setattr(product, field, value)
+        setattr(current, field, value)
     await db.commit()
-    return product
+    return current
 
 
 async def soft_delete_product(db: AsyncSession, product: Product) -> None:

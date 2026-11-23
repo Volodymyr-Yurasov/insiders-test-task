@@ -16,7 +16,8 @@ docker compose exec api python -m src.seed   # optional demo data (idempotent)
 
 - API: <http://localhost:8000>
 - Interactive docs: <http://localhost:8000/docs>. Docs are served only when `ENVIRONMENT` is `local` or `staging`; the default is `production`, which hides them.
-- Logins: `admin / admin-dev-password` (from `FIRST_ADMIN_*`), and `storekeeper / storekeeper-pass` after seeding.
+- Logins: `admin / admin-dev-password` (from `FIRST_ADMIN_*`), and `storekeeper / storekeeper-pass` after seeding (password from `SEED_STOREKEEPER_PASSWORD`; the seed refuses to run when `ENVIRONMENT=production`).
+- Postgres and Redis are published on `127.0.0.1` only.
 
 In `/docs`, click **Authorize**, enter the username and password, and you're done. It's a standard OAuth2 password flow.
 
@@ -33,7 +34,7 @@ The tests run against the real Postgres and Redis from compose. They use a separ
 ```bash
 docker compose up -d db redis
 uv sync
-uv run pytest               # 49 tests, ~25 s
+uv run pytest               # 57 tests, ~30 s
 uv run ruff check . && uv run ruff format --check . && uv run mypy src tests
 uv run alembic check        # models and migrations in sync
 ```
@@ -116,6 +117,9 @@ The lock order (warehouses → products, by id) rules out deadlocks. A lock wait
 - Access tokens are JWTs (HS256), checked through FastAPI dependencies (`CurrentUser`, `AdminUser`). The user is re-read from the DB on every request, so deactivation and role changes apply immediately.
 - Refresh tokens are opaque strings stored only as a SHA-256 hash. Each refresh rotates the token atomically, and reusing an old one revokes the whole login chain.
 - Login gives the same response for an unknown user, a wrong password and an inactive user, with a dummy hash check to equalize timing.
+- **Login throttling:** sliding-window limits per client IP and per username, checked before any password hashing. At most `PASSWORD_HASH_CONCURRENCY` argon2 computations run at once, so a login flood can't monopolize the thread pool.
+- **Token issuance vs user changes:** login and refresh lock the user row `FOR SHARE`, and user edits lock it `FOR NO KEY UPDATE`. A password change or deactivation therefore can never miss a token minted at the same moment.
+- **The bootstrap admin** is created only when no admin exists at all, so renaming it doesn't bring the default account back on restart.
 - argon2 hashing runs in a worker thread so it doesn't block the server.
 
 **Idempotency (bonus).** Two layers:
@@ -140,6 +144,7 @@ The lock order (warehouses → products, by id) rules out deadlocks. A lock wait
 - **Valuation uses the current base price,** as the spec says, not historical cost.
 - **`BackgroundTasks` is best-effort:** a task is lost if the worker dies after responding. In production, an outbox row plus a queue worker would make it durable.
 - **Idempotency keys are reserved permanently, not for 24 h.** Redis replays a result for 24 h, but the Postgres unique constraint that guarantees exactly-once never expires. Reusing a key later with a *different* request returns `422 idempotency_key_reused`. Clients should use a fresh unique key (e.g. a UUID) per logical operation, which is the usual contract (Stripe works the same way). It's safer than letting an old key silently start a new write-off.
+- **Per-username login throttling can be abused to lock a user out briefly:** an attacker can keep an account at its attempt cap while the window keeps sliding. This is accepted, because the alternative is unlimited password guessing. The per-IP cap and a short window (60 s) limit the impact.
 - **Strict refresh rotation:** a client that retries a refresh almost simultaneously (e.g. a double-click) trips reuse detection and must log in again. A short grace window is a possible extension.
 
 ## Configuration
@@ -156,6 +161,9 @@ All settings come from environment variables or `.env`; see [.env.example](.env.
 | `VALUATION_CACHE_TTL_S` | 300 | cache safety-net TTL |
 | `RATE_LIMIT_MAX_REQUESTS` / `RATE_LIMIT_WINDOW_S` | 50 / 60 | per-user movement limit |
 | `LOW_STOCK_ALERT_EMAIL` | `inventory-alerts@example.com` | recipient written in the log |
+| `LOGIN_MAX_ATTEMPTS_PER_IP` / `_PER_USERNAME` / `LOGIN_WINDOW_S` | 30 / 10 / 60 | login throttling |
+| `PASSWORD_HASH_CONCURRENCY` | 4 | concurrent argon2 computations |
+| `SEED_STOREKEEPER_PASSWORD` | unset | demo storekeeper created by the seed (dev only) |
 
 ## Project layout
 

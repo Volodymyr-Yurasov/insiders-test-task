@@ -44,39 +44,45 @@ class Decision:
     limit: int
     remaining: int
     retry_after_s: int = 0
+    key: str = ""
     # The ZSET member recorded for this request (None if denied or Redis was down);
     # lets a request that turns out to write nothing give its slot back.
     member: str | None = None
 
 
 async def hit(redis: Redis, user_id: int) -> Decision:
-    """Record one transaction attempt for the user if within the limit."""
-    limit = rate_limit_settings.RATE_LIMIT_MAX_REQUESTS
-    window_ms = int(rate_limit_settings.RATE_LIMIT_WINDOW_S * 1000)
+    """Record one movement transaction attempt for the employee if within the limit."""
+    return await check(
+        redis,
+        f"rl:{user_id}",
+        rate_limit_settings.RATE_LIMIT_MAX_REQUESTS,
+        rate_limit_settings.RATE_LIMIT_WINDOW_S,
+    )
+
+
+async def check(redis: Redis, key: str, limit: int, window_s: float) -> Decision:
+    """Generic sliding-window check-and-record for any key (movements, login attempts)."""
+    window_ms = int(window_s * 1000)
     member = uuid.uuid4().hex  # unique: two requests in the same millisecond still count twice
     try:
         allowed, remaining, retry_after_ms = await redis.eval(
-            _SLIDING_WINDOW, 1, _key(user_id), limit, window_ms, member
+            _SLIDING_WINDOW, 1, key, limit, window_ms, member
         )
     except RedisError:
-        # Fail open: stock operations matter more than the limiter being available.
+        # Fail open: availability matters more than the limiter being available.
         logger.error("rate limiter unavailable; allowing the request", exc_info=True)
-        return Decision(allowed=True, limit=limit, remaining=limit)
+        return Decision(allowed=True, limit=limit, remaining=limit, key=key)
     if not allowed:
         retry_after_s = max(1, math.ceil(int(retry_after_ms) / 1000))
-        return Decision(False, limit, 0, retry_after_s)
-    return Decision(True, limit, int(remaining), member=member)
+        return Decision(False, limit, 0, retry_after_s, key=key)
+    return Decision(True, limit, int(remaining), key=key, member=member)
 
 
-async def refund(redis: Redis, user_id: int, decision: Decision) -> None:
+async def refund(redis: Redis, decision: Decision) -> None:
     """Give back the slot of a request that turned out to write nothing (idempotent replay)."""
     if decision.member is None:
         return
     try:
-        await redis.zrem(_key(user_id), decision.member)
+        await redis.zrem(decision.key, decision.member)
     except RedisError:
         logger.warning("could not refund rate-limit slot", exc_info=True)
-
-
-def _key(user_id: int) -> str:
-    return f"rl:{user_id}"

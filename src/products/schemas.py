@@ -11,7 +11,7 @@ from pydantic import (
     model_validator,
 )
 
-from src.schemas import CENTS, CustomModel, Name, PatchModel, strip_upper
+from src.schemas import CENTS, CustomModel, DbId, Name, PatchModel, strip_upper
 
 Sku = Annotated[
     str,
@@ -69,7 +69,7 @@ class ProductListQuery(CustomModel):
     min_stock: Annotated[int | None, Field(ge=0)] = None
     max_stock: Annotated[int | None, Field(ge=0)] = None
     below_min_stock: bool = False
-    warehouse_id: int | None = None
+    warehouse_id: DbId | None = None
     # Literal whitelist: the sort key is never interpolated into SQL.
     sort: Literal["id", "sku", "name", "price", "stock"] = "id"
     order: Literal["asc", "desc"] = "asc"

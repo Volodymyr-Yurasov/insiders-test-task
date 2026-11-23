@@ -29,6 +29,7 @@ from src.rate_limit import service as rate_limit_service
 from src.rate_limit.exceptions import RateLimited
 from src.redis import get_redis
 from src.reports.dependencies import ValuationCache
+from src.schemas import IdQuery
 
 # Storekeepers and admins may both create movements (spec 2.6).
 router = APIRouter(prefix="/movements", tags=["movements"], dependencies=[Depends(current_user)])
@@ -54,8 +55,8 @@ ERRORS: dict[int | str, dict[str, Any]] = {
 async def list_movements(
     db: DbSession,
     page: Pagination,
-    product_id: int | None = None,
-    warehouse_id: int | None = None,
+    product_id: IdQuery = None,
+    warehouse_id: IdQuery = None,
     type: MovementType | None = None,
     date_from: datetime | None = None,
     date_to: datetime | None = None,
@@ -179,16 +180,17 @@ async def _record(
         if decision.token is not None:
             claim = _Claim(key, request_fp, decision.token)
 
-    # Rate limit AFTER the replay check (replays write nothing and cost no quota) and BEFORE
-    # the engine (failed business attempts still count: the limit protects the system).
-    limit = await rate_limit_service.hit(ctx.redis, ctx.user_id)
-    if not limit.allowed:
-        await _release(ctx, claim)
-        raise RateLimited(limit.retry_after_s)
-
+    # From the moment the marker is claimed until the engine has committed, ANY way out
+    # (429, business error, unexpected exception, CancelledError when the client is gone)
+    # releases it, so a retry with the same key is never stuck behind "in progress".
     try:
+        # Rate limit AFTER the replay check (replays write nothing and cost no quota) and
+        # BEFORE the engine (failed business attempts still count: it protects the system).
+        limit = await rate_limit_service.hit(ctx.redis, ctx.user_id)
+        if not limit.allowed:
+            raise RateLimited(limit.retry_after_s)
         result = await movements_service.execute(ctx.db, ctx.user_id, build(key, request_fp))
-    except BaseException:  # incl. CancelledError (client gone): never strand the marker
+    except BaseException:
         await _release(ctx, claim)
         raise
 
@@ -200,7 +202,7 @@ async def _record(
     if result.replayed:
         # The DB already had this key's operation (Redis record expired or unavailable):
         # nothing was written, so the attempt gives its rate-limit slot back.
-        await rate_limit_service.refund(ctx.redis, ctx.user_id, limit)
+        await rate_limit_service.refund(ctx.redis, limit)
         return _replayed(status.HTTP_201_CREATED, payload)
 
     ctx.response.headers["X-RateLimit-Limit"] = str(limit.limit)

@@ -1,7 +1,8 @@
 from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Request, status
 from fastapi.security import OAuth2PasswordRequestForm
+from redis.asyncio import Redis
 from sqlalchemy import select
 
 from src.auth import service as auth_service
@@ -11,6 +12,8 @@ from src.auth.models import AppUser
 from src.auth.schemas import RefreshRequest, TokenPair, UserCreate, UserRead, UserUpdate
 from src.database import DbSession
 from src.pagination import Page, Pagination, paginate
+from src.redis import get_redis
+from src.schemas import IdPath
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -22,12 +25,21 @@ users_router = APIRouter(prefix="/users", tags=["users"], dependencies=[Depends(
     "/token",
     response_model=TokenPair,
     summary="Log in with username and password (OAuth2 password form)",
-    responses={401: {"description": "Invalid credentials"}},
+    responses={
+        401: {"description": "Invalid credentials"},
+        429: {"description": "Too many login attempts for this username or client"},
+    },
 )
 async def login(
     form: Annotated[OAuth2PasswordRequestForm, Depends()],
+    request: Request,
     db: DbSession,
+    redis: Annotated[Redis, Depends(get_redis)],
 ) -> TokenPair:
+    # The direct peer address; X-Forwarded-For is deliberately not trusted (spoofable)
+    # unless a proxy is configured to set it, e.g. uvicorn --proxy-headers.
+    client_ip = request.client.host if request.client else "unknown"
+    await auth_service.throttle_login(redis, form.username, client_ip)
     user = await auth_service.authenticate(db, form.username, form.password)
     if user is None:
         raise InvalidCredentials()
@@ -106,6 +118,6 @@ async def get_user(user: Annotated[AppUser, Depends(valid_user_id)]) -> AppUser:
         409: {"description": "Username taken, or last active admin"},
     },
 )
-async def update_user(user_id: int, body: UserUpdate, db: DbSession) -> AppUser:
+async def update_user(user_id: IdPath, body: UserUpdate, db: DbSession) -> AppUser:
     # Not using valid_user_id: the service must load the target *after* taking its locks.
     return await auth_service.update_user(db, user_id, body)

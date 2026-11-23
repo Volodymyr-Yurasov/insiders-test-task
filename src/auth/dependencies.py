@@ -15,6 +15,7 @@ from src.auth.exceptions import InvalidToken, UserNotFound
 from src.auth.models import AppUser
 from src.database import DbSession
 from src.exceptions import NotAuthenticated, PermissionDenied
+from src.schemas import IdPath
 
 # auto_error=False: a missing token is reported through our own 401 format.
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/token", auto_error=False)
@@ -46,7 +47,7 @@ async def admin_user(user: CurrentUser) -> AppUser:
 AdminUser = Annotated[AppUser, Depends(admin_user)]
 
 
-async def valid_user_id(user_id: int, db: DbSession) -> AppUser:
+async def valid_user_id(user_id: IdPath, db: DbSession) -> AppUser:
     user = await db.get(AppUser, user_id)
     if user is None:
         raise UserNotFound()

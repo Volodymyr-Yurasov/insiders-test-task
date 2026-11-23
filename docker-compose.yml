@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-inventory}
       POSTGRES_DB: ${POSTGRES_DB:-inventory}
     ports:
-      - "${POSTGRES_HOST_PORT:-5432}:5432"
+      # Loopback only: dev credentials and an unauthenticated Redis must not face the network.
+      - "127.0.0.1:${POSTGRES_HOST_PORT:-5432}:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
@@ -18,7 +19,7 @@ services:
   redis:
     image: redis:7-alpine
     ports:
-      - "${REDIS_HOST_PORT:-6379}:6379"
+      - "127.0.0.1:${REDIS_HOST_PORT:-6379}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 3s
@@ -34,6 +35,7 @@ services:
       JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set (see .env.example)}
       FIRST_ADMIN_USERNAME: ${FIRST_ADMIN_USERNAME:-}
       FIRST_ADMIN_PASSWORD: ${FIRST_ADMIN_PASSWORD:-}
+      SEED_STOREKEEPER_PASSWORD: ${SEED_STOREKEEPER_PASSWORD:-}
     ports:
       - "${API_HOST_PORT:-8000}:8000"
     depends_on:

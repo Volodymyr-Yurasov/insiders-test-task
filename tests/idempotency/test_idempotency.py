@@ -12,6 +12,7 @@ from sqlalchemy import func, select
 
 from src.auth.constants import Role
 from src.movements.models import Operation
+from src.rate_limit import service as rate_limit_service
 from tests.conftest import CreateUser, MakeProduct, MakeWarehouse, auth_headers
 
 REPLAYED = "idempotent-replayed"
@@ -191,3 +192,25 @@ async def test_corrupt_redis_record_falls_back_to_the_db(
     assert first.status_code == retry.status_code == 201  # no 500
     assert retry.headers[REPLAYED] == "true"  # the DB constraint still deduplicated
     assert await _stock(client, storekeeper_headers, product_id) == 9
+
+
+async def test_marker_released_when_failing_before_the_engine(
+    app: FastAPI,
+    client: AsyncClient,
+    storekeeper: Any,
+    storekeeper_headers: dict[str, str],
+    stocked: tuple[int, int, str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected error between claiming the key and running the engine (here: inside
+    the rate limiter) must not leave the key stuck "in progress"."""
+    warehouse_id, _, sku = stocked
+
+    async def broken_hit(*args: Any) -> Any:
+        raise RuntimeError("limiter exploded")
+
+    monkeypatch.setattr(rate_limit_service, "hit", broken_hit)
+    headers = {**storekeeper_headers, "Idempotency-Key": "fragile"}
+    with pytest.raises(RuntimeError):
+        await client.post("/movements", json=_out(sku, 1, warehouse_id), headers=headers)
+    assert await app.state.redis.get(f"idem:{storekeeper.id}:fragile") is None

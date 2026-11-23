@@ -17,12 +17,14 @@ def valuation_query() -> Select[int, str, str, bool, int, Decimal]:
     Σ(signed movement qty * current base price) = Σ(stock * price), since the price is per
     product: no intermediate per-product stock step. LEFT JOINs keep warehouses that have no
     movements (an inner product join would silently drop them); COALESCE turns their NULL
-    sums into 0, and numeric(20,2) renders "0.00" and can't overflow numeric(12,2).
+    sums into 0, rounded to cents ("0.00").
     """
     signed_quantity = case((SM.to_warehouse_id == Warehouse.id, SM.quantity), else_=-SM.quantity)
     total_units = func.coalesce(func.sum(signed_quantity), 0).cast(BigInteger)
-    total_value = func.coalesce(func.sum(signed_quantity * Product.base_price), 0).cast(
-        Numeric(20, 2)
+    # Unbounded NUMERIC rounded to cents: no fixed precision to overflow (numeric(20,2) would
+    # fail past 1e18), and round(.., 2) still renders an empty warehouse as "0.00".
+    total_value = func.round(
+        func.coalesce(func.sum(signed_quantity * Product.base_price), 0), 2, type_=Numeric()
     )
     return (
         select(

@@ -25,7 +25,7 @@ class PageParams(CustomModel):
 
 async def page_params(
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: Annotated[int, Query(ge=0, le=1_000_000_000)] = 0,
 ) -> PageParams:
     return PageParams(limit=limit, offset=offset)
 

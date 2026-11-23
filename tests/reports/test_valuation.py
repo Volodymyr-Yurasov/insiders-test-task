@@ -1,7 +1,10 @@
 from typing import Any
 
+from fastapi import FastAPI
 from httpx import AsyncClient
+from sqlalchemy import insert
 
+from src.movements.models import Operation, StockMovement
 from tests.conftest import MakeProduct, MakeWarehouse
 
 
@@ -61,3 +64,39 @@ async def test_valuation(
     # Admin only.
     assert (await client.get("/reports/valuation", headers=storekeeper_headers)).status_code == 403
     assert (await client.get("/reports/valuation")).status_code == 401
+
+
+async def test_valuation_handles_huge_values(
+    app: FastAPI,
+    client: AsyncClient,
+    admin: Any,
+    admin_headers: dict[str, str],
+    make_warehouse: MakeWarehouse,
+    make_product: MakeProduct,
+) -> None:
+    """Max price x many max-quantity INs exceeds numeric(20,2): must still be exact, not 500."""
+    warehouse = await make_warehouse()
+    product = await make_product(price="9999999999.99")
+    async with app.state.session_factory() as db:  # direct inserts: past API rate limits
+        operation_id = await db.scalar(
+            insert(Operation).values(type="IN", performed_by=admin.id).returning(Operation.id)
+        )
+        await db.execute(
+            insert(StockMovement),
+            [
+                {
+                    "operation_id": operation_id,
+                    "type": "IN",
+                    "product_id": product.id,
+                    "quantity": 1_000_000,
+                    "to_warehouse_id": warehouse.id,
+                    "performed_by": admin.id,
+                }
+            ]
+            * 200,
+        )
+        await db.commit()
+
+    r = await client.get("/reports/valuation", headers=admin_headers)
+    assert r.status_code == 200
+    assert r.json()["grand_total"] == "1999999999998000000.00"  # 2e8 units * 9999999999.99

@@ -17,6 +17,7 @@ from src.products.schemas import (
     ProductUpdate,
 )
 from src.reports.dependencies import ValuationCache
+from src.schemas import IdPath
 from src.warehouses.dependencies import valid_warehouse_id
 
 # Every route needs a logged-in user; write routes additionally require admin.
@@ -67,7 +68,7 @@ async def list_products(
     summary="Get a product with its total and per-warehouse stock",
     responses=NOT_FOUND,
 )
-async def get_product(product_id: int, db: DbSession) -> ProductDetail:
+async def get_product(product_id: IdPath, db: DbSession) -> ProductDetail:
     # No ValidProduct dependency: the detail query itself 404s, keeping this ONE statement.
     return await products_service.get_product_detail(db, product_id)
 

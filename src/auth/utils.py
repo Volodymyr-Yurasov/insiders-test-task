@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import secrets
 from datetime import UTC, datetime, timedelta
@@ -8,6 +9,7 @@ from pwdlib import PasswordHash
 
 from src.auth.config import auth_settings
 from src.auth.exceptions import InvalidToken
+from src.schemas import INT32_MAX
 
 _hasher = PasswordHash.recommended()  # argon2id
 
@@ -20,13 +22,19 @@ def normalize_username(username: str) -> str:
     return username.strip().lower()
 
 
-# argon2 is deliberately CPU-heavy (~50 ms): keep it off the event loop.
+# argon2 is deliberately CPU-heavy (~50 ms): keep it off the event loop, and cap how many
+# run at once so a login flood can't occupy the whole shared threadpool.
+_hash_slots = asyncio.Semaphore(auth_settings.PASSWORD_HASH_CONCURRENCY)
+
+
 async def hash_password(password: str) -> str:
-    return await run_in_threadpool(_hasher.hash, password)
+    async with _hash_slots:
+        return await run_in_threadpool(_hasher.hash, password)
 
 
 async def verify_password(password: str, password_hash: str) -> bool:
-    return await run_in_threadpool(_hasher.verify, password, password_hash)
+    async with _hash_slots:
+        return await run_in_threadpool(_hasher.verify, password, password_hash)
 
 
 async def burn_password_check(password: str) -> None:
@@ -51,9 +59,12 @@ def decode_access_token(token: str) -> int:
             algorithms=[auth_settings.JWT_ALG],  # pinned: rejects alg=none / alg switching
             options={"require": ["exp", "iat", "sub"]},
         )
-        return int(claims["sub"])
+        user_id = int(claims["sub"])
     except (jwt.InvalidTokenError, ValueError) as exc:
         raise InvalidToken() from exc
+    if not 1 <= user_id <= INT32_MAX:  # never hand an out-of-range id to the DB driver
+        raise InvalidToken()
+    return user_id
 
 
 def create_access_token(user_id: int, *, expires_delta: timedelta | None = None) -> str:

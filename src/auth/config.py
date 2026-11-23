@@ -14,6 +14,14 @@ class AuthConfig(BaseSettings):
     REFRESH_TOKEN_RETENTION_DAYS: int = Field(default=7, ge=0)
     REFRESH_TOKEN_PRUNE_BATCH: int = Field(default=1000, ge=1)
 
+    # Login throttling (sliding window): guessing one account, and floods from one client.
+    LOGIN_MAX_ATTEMPTS_PER_USERNAME: int = Field(default=10, ge=1)
+    LOGIN_MAX_ATTEMPTS_PER_IP: int = Field(default=30, ge=1)
+    LOGIN_WINDOW_S: float = Field(default=60, gt=0)
+    # Concurrent argon2 computations; extra requests queue instead of saturating the shared
+    # threadpool (which every other sync dependency/route also needs).
+    PASSWORD_HASH_CONCURRENCY: int = Field(default=4, ge=1)
+
     # Optional first-admin seed (both must be set; empty values mean "skip").
     FIRST_ADMIN_USERNAME: str | None = None
     FIRST_ADMIN_PASSWORD: SecretStr | None = None

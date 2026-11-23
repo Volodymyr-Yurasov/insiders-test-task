@@ -1,9 +1,17 @@
 from decimal import Decimal
 from typing import Annotated, Any, Self
 
-from pydantic import BaseModel, ConfigDict, StringConstraints, model_validator
+from fastapi import Path, Query
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 CENTS = Decimal("0.01")
+
+# Primary keys are INTEGER (int32). Bounding every incoming id makes out-of-range values a
+# 422 instead of a driver error (500) when asyncpg refuses to encode them.
+INT32_MAX = 2_147_483_647
+DbId = Annotated[int, Field(ge=1, le=INT32_MAX)]  # body fields / query models
+IdPath = Annotated[int, Path(ge=1, le=INT32_MAX)]
+IdQuery = Annotated[int | None, Query(ge=1, le=INT32_MAX)]
 
 # Human-readable names: trimmed, non-empty.
 Name = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=255)]

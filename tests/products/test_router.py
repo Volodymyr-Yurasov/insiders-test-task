@@ -1,4 +1,12 @@
+import pytest
+from fastapi import FastAPI
 from httpx import AsyncClient
+
+from src.products import service as products_service
+from src.products.exceptions import ProductNotFound
+from src.products.models import Product
+from src.products.schemas import ProductUpdate
+from tests.conftest import MakeProduct
 
 
 async def test_product_crud(
@@ -52,3 +60,16 @@ async def test_product_crud(
     # ...but its SKU stays reserved (D9).
     reuse = await client.post("/products", json=body, headers=admin_headers)
     assert reuse.status_code == 409 and reuse.json()["code"] == "sku_taken"
+
+
+async def test_update_does_not_resurrect_a_concurrently_deleted_product(
+    app: FastAPI, client: AsyncClient, admin_headers: dict[str, str], make_product: MakeProduct
+) -> None:
+    product = await make_product()
+    async with app.state.session_factory() as db:
+        stale = await db.get(Product, product.id)  # loaded before the delete, like ValidProduct
+        assert stale is not None
+        deleted = await client.delete(f"/products/{product.id}", headers=admin_headers)
+        assert deleted.status_code == 204
+        with pytest.raises(ProductNotFound):
+            await products_service.update_product(db, stale, ProductUpdate(name="Resurrected"))

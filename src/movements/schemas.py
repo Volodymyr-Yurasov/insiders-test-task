@@ -5,7 +5,7 @@ from pydantic import Field, model_validator
 
 from src.movements.constants import MAX_BATCH_ITEMS, MAX_QUANTITY, MovementType
 from src.products.schemas import Sku
-from src.schemas import CustomModel
+from src.schemas import CustomModel, DbId
 
 Quantity = Annotated[int, Field(ge=1, le=MAX_QUANTITY)]
 
@@ -14,8 +14,8 @@ class _Route(CustomModel):
     """Which warehouses a movement touches; the allowed shape depends on the type."""
 
     type: MovementType
-    from_warehouse_id: int | None = None
-    to_warehouse_id: int | None = None
+    from_warehouse_id: DbId | None = None
+    to_warehouse_id: DbId | None = None
 
     @model_validator(mode="after")
     def _check_shape(self) -> Self:

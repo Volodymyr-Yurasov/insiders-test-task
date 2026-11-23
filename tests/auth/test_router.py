@@ -278,3 +278,23 @@ def _bearer(pair: dict[str, str]) -> dict[str, str]:
 
 async def _refresh(client: AsyncClient, pair: dict[str, str]) -> Response:
     return await client.post("/auth/refresh", json={"refresh_token": pair["refresh_token"]})
+
+
+async def test_login_is_throttled(
+    client: AsyncClient, create_user: CreateUser, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(auth_settings, "LOGIN_MAX_ATTEMPTS_PER_USERNAME", 3)
+    monkeypatch.setattr(auth_settings, "LOGIN_MAX_ATTEMPTS_PER_IP", 5)
+    await create_user(username="target")
+
+    async def attempt(username: str) -> Response:
+        return await client.post("/auth/token", data={"username": username, "password": "guess"})
+
+    # Per username: guessing one account is capped (checked before any argon2 work).
+    assert [(await attempt("target")).status_code for _ in range(3)] == [401, 401, 401]
+    blocked = await attempt("TARGET")  # normalized: same account
+    assert blocked.status_code == 429 and blocked.json()["code"] == "rate_limited"
+    assert int(blocked.headers["retry-after"]) >= 1
+    # Per client IP: spraying other usernames hits the IP cap (5 attempts in the window).
+    assert (await attempt("someone-else")).status_code == 401
+    assert (await attempt("third-user")).status_code == 429
