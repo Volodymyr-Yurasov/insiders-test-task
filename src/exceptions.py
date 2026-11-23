@@ -4,12 +4,18 @@ Module exceptions subclass these and override CODE/DETAIL. Every one is rendered
 handler as `{"code": ..., "detail": ..., **extra}` so clients get one error shape.
 """
 
+import logging
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
-from fastapi import FastAPI, Request, status
+from fastapi import FastAPI, Request, Response, status
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from src.constants import ErrorCode
+
+logger = logging.getLogger(__name__)
 
 
 class DetailedHTTPException(Exception):
@@ -49,14 +55,62 @@ class Conflict(DetailedHTTPException):
     DETAIL = "Conflict"
 
 
+def _error(
+    status_code: int,
+    code: str,
+    detail: str,
+    *,
+    headers: Mapping[str, str] | None = None,
+    **extra: Any,
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status_code,
+        content={"code": code, "detail": detail, **extra},
+        headers=dict(headers) if headers else None,
+    )
+
+
 async def _detailed_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, DetailedHTTPException)
-    return JSONResponse(
-        status_code=exc.STATUS_CODE,
-        content={"code": str(exc.CODE), "detail": exc.detail, **exc.extra},
-        headers=exc.HEADERS,
+    return _error(exc.STATUS_CODE, exc.CODE, exc.detail, headers=exc.HEADERS, **exc.extra)
+
+
+async def _validation_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+    assert isinstance(exc, RequestValidationError)
+    # Only loc/msg/type: Pydantic's `input` would echo submitted values (e.g. passwords)
+    # back to the client, and `ctx` may hold non-JSON-serializable exception objects.
+    errors = [{"loc": e["loc"], "msg": e["msg"], "type": e["type"]} for e in exc.errors()]
+    return _error(
+        status.HTTP_422_UNPROCESSABLE_CONTENT,
+        ErrorCode.VALIDATION_ERROR,
+        "Request validation failed",
+        errors=errors,
+    )
+
+
+_CODE_BY_STATUS = {
+    status.HTTP_404_NOT_FOUND: ErrorCode.NOT_FOUND,
+    status.HTTP_405_METHOD_NOT_ALLOWED: ErrorCode.METHOD_NOT_ALLOWED,
+}
+
+
+async def _http_exception_handler(_: Request, exc: Exception) -> Response:
+    # Framework-raised errors: unknown route, wrong method, FastAPI internals.
+    assert isinstance(exc, StarletteHTTPException)
+    code = _CODE_BY_STATUS.get(exc.status_code, ErrorCode.HTTP_ERROR)
+    return _error(exc.status_code, code, str(exc.detail), headers=exc.headers)
+
+
+async def unhandled_exception_handler(_: Request, exc: Exception) -> JSONResponse:
+    # Logged with traceback; the client gets nothing internal.
+    logger.error("unhandled exception", exc_info=exc)
+    return _error(
+        status.HTTP_500_INTERNAL_SERVER_ERROR, ErrorCode.INTERNAL_ERROR, "Internal server error"
     )
 
 
 def register_exception_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DetailedHTTPException, _detailed_exception_handler)
+    app.add_exception_handler(RequestValidationError, _validation_exception_handler)
+    app.add_exception_handler(StarletteHTTPException, _http_exception_handler)
+    app.add_exception_handler(Exception, unhandled_exception_handler)

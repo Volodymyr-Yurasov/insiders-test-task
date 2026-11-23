@@ -11,7 +11,9 @@ from src.config import settings
 from src.database import create_engine, create_session_factory
 from src.exceptions import register_exception_handlers
 from src.health import router as health_router
+from src.products import router as products_router
 from src.redis import create_redis
+from src.warehouses import router as warehouses_router
 
 # Application loggers (e.g. seed, notifications) at INFO; no-op if logging is already set up.
 logging.basicConfig(level=logging.INFO, format="%(levelname)s:     %(name)s - %(message)s")
@@ -44,6 +46,8 @@ def create_app() -> FastAPI:
     app.include_router(health_router.router)
     app.include_router(auth_router.router)
     app.include_router(auth_router.users_router)
+    app.include_router(warehouses_router.router)
+    app.include_router(products_router.router)
     return app
 
 

@@ -121,7 +121,7 @@ Each step ends with a **check** that must pass before the next step starts. Test
 ### Step 1b — Align the skeleton with §0b (refactor only, no new behavior)
 - Rename `app/` → `src/` and `migrations/` → `alembic/`. Flatten `core/*` into `src/{config,database,redis}.py`, and move health into `src/health/router.py`.
 - Add `src/schemas.py` (`CustomModel`), `src/constants.py` (`Environment`) and the `ENVIRONMENT`-based docs toggle.
-  - `src/exceptions.py` + `ErrorCode` move to **Step 2** and `src/pagination.py` to **Step 5**, where each is first used and tested.
+  - `src/exceptions.py` + `ErrorCode` move to **Step 2**, and `src/pagination.py` to **Step 3**, where each is first used and tested.
 - Switch to the guide's constraint-naming convention and the `date_slug` migration file template, and rename the baseline migration.
 - `get_redis` becomes `async def`. It is currently sync, so it runs in the threadpool on every request.
 - Config: a single `DATABASE_URL` (`PostgresDsn`) in place of the separate fields. `conftest.py` sets the test env (`…/inventory_test`, Redis DB 15) before importing `src`.
@@ -166,17 +166,27 @@ Each step ends with a **check** that must pass before the next step starts. Test
   - user edit/deactivate incl. the concurrent last-admin race
   - seed idempotency
 
-### Step 3 — Warehouses & products CRUD
-- Warehouses: POST/PATCH (admin), GET (any). Deactivation follows D8.
-- Products: POST/PATCH/DELETE (soft) (admin), GET single (any).
+### Step 3 — Unified errors, pagination, warehouses & products CRUD
+- **Unified error format:** FastAPI's own errors (422 validation, 404 unknown route, 405, other `HTTPException`s, unhandled 500s) are re-rendered as `{"code", "detail", ...}`. Validation adds an `errors` list.
+- **Pagination foundation** (moved here from Step 5):
+  - `PageParams` (`limit` 1..100, `offset` ≥ 0) and `Page[T]` `{items, total, limit, offset}`.
+  - `paginate()` gets `total` from `COUNT(*) OVER()` in the same query.
+  - First users: `GET /users` and `GET /warehouses`.
+- Warehouses: POST/PATCH (admin); GET list/single (any authenticated user).
+- Products: POST/PATCH/DELETE (soft) (admin); GET single (any). The SKU is immutable after creation.
+- **D8 guards** (deactivate a warehouse / delete a product only at zero stock) need movements, so they land in **Step 4**. In Step 3, deactivation and soft-delete are unconditional.
 - Edge cases:
   - Duplicate SKU or location_code on create: `INSERT … ON CONFLICT (sku) DO NOTHING RETURNING id`; no row returned → 409.
     - Not a pre-check SELECT: that races.
     - Not catching `IntegrityError`: a unique violation aborts the whole Postgres transaction.
     - `ON CONFLICT` is INSERT-only, so a PATCH that changes a unique field (e.g. `location_code`) still catches `IntegrityError` → 409.
   - PATCH of an unknown or deleted id → 404.
-  - Soft-delete or deactivate takes the same row lock as movements (`FOR UPDATE`), then checks stock = 0. This closes the race with a concurrent IN.
-- **Check:** covered by the fixtures of later tests, plus one assert in the step 2 test that a duplicate SKU → 409. No separate CRUD test suite.
+- **Check (3 test functions):**
+  - error format
+  - warehouse CRUD
+  - product CRUD (incl. duplicate SKU → 409, also against a soft-deleted product)
+
+  Plus one `GET /users` assertion in the existing admin test.
 
 ### Step 4 — Movement engine (core: 2.1 + 2.2)
 - `POST /movements`: single line. `type` + product_id/sku + qty + from/to by type.
@@ -192,6 +202,9 @@ Each step ends with a **check** that must pass before the next step starts. Test
   6. Insert the `operation` and the movements, commit.
   7. **After commit:** invalidate the cache (step 6) and schedule notifications (step 7).
 - Add `SET LOCAL lock_timeout = '5s'`. On timeout → 503 with `Retry-After` instead of a hung request.
+- **D8 guards (moved from Step 3):**
+  - Product soft-delete and warehouse deactivation take the same row lock as movements (`FOR UPDATE` on the product / warehouse row), then check stock = 0 → otherwise 409.
+  - This closes the race with a concurrent IN.
 - `GET /movements`: history with filters (product, warehouse, type, date range) and pagination.
 - `GET /products/{product_id}`: product plus per-warehouse stock breakdown, built with `json_agg` in one query (C11).
 - **Checks (the 3 required tests):**
@@ -200,7 +213,7 @@ Each step ends with a **check** that must pass before the next step starts. Test
   3. **Dynamic stock:** IN 10 → W1; TRANSFER 4 W1→W2; OUT 3 from W2 → W1=6, W2=1, total=7.
 
 ### Step 5 — SQL aggregations without N+1 (2.3)
-- Foundation first: `src/pagination.py` (`PageParams` dependency + generic `Page[T]`).
+- Reuses `src/pagination.py` from Step 3.
 - `GET /products`: **one** query returning products with `total_stock`. `total` comes from `COUNT(*) OVER()` in the same query, so the count and the page come from the same snapshot; a separate count query could disagree with the page under concurrent writes.
   - An offset past the end returns zero rows, so `COUNT(*) OVER()` has nowhere to put the total. Only in that case, run a separate count (rare).
   - Total: `COALESCE(SUM(CASE WHEN type='IN' THEN qty WHEN type='OUT' THEN -qty ELSE 0 END), 0)`. TRANSFER nets to zero in the total.
@@ -292,7 +305,7 @@ Test files mirror `src/` packages (C12).
 |---|------|------|
 | 1 | Smoke: `/health` OK + docs toggle by environment | 1, 1b |
 | 2 | Auth: login (no enumeration), access matrix (401/403/200, duplicate username 409), refresh rotation + reuse detection + logout, user edit/deactivate + concurrent last-admin guard, seed idempotency | 2 |
-| 2b | Duplicate SKU 409 (one assertion in a CRUD test) | 3 |
+| 2b | Unified error format; warehouse CRUD; product CRUD (duplicate SKU 409, also vs. soft-deleted) | 3 |
 | 3 | **Race: concurrent OUT never goes below zero** (required) | 4 |
 | 4 | **Batch all-or-nothing + shortage details** (required) | 4 |
 | 5 | **IN → TRANSFER → OUT stock correctness** (required) | 4 |

@@ -325,4 +325,123 @@
 - [x] `uv run pytest` green (3 existing + 5 new test functions); ruff + mypy clean
 - [x] Alembic round-trip + `alembic check` no diff
 - [x] Compose end-to-end: seeded admin login → me → refresh → logout; restart is idempotent
-- [ ] Human review, then plan Step 3 (Warehouses & products CRUD)
+- [x] Human review: approved 2026-11-23 (committed a69153b)
+
+---
+---
+
+# Todo — Step 3: Unified errors, pagination, warehouses & products
+
+## Task 13: Unified error format for FastAPI/Starlette/unhandled errors
+
+**Description:** Register handlers so that every error response has the shape `{"code", "detail", ...}`. Validation errors get an `errors` list. Unknown routes and 405s get codes, and unhandled exceptions become a logged, opaque 500.
+
+**Acceptance criteria:**
+- [x] 422 → `{"code": "validation_error", "detail": "Request validation failed", "errors": [{"loc", "msg", "type"}]}`.
+- [x] Unknown route → `404 {"code": "not_found"}`. Wrong method → `405 {"code": "method_not_allowed"}` with the `Allow` header preserved.
+- [x] Unhandled exception → `500 {"code": "internal_error"}` and a logged traceback.
+
+**Verification:**
+- [x] `tests/test_exceptions.py::test_error_format`: 404, 405 and 422 shapes over HTTP. The 500 handler is called directly.
+- [x] The existing `test_admin_manages_users` is updated to read `errors`; suite green; ruff + mypy clean.
+
+**Dependencies:** Step 2
+
+**Files likely touched:** `src/exceptions.py`, `src/constants.py`, `tests/test_exceptions.py`, `tests/auth/test_router.py`
+
+**Estimated scope:** Small
+
+---
+
+## Task 14: Pagination foundation + `GET /users`
+
+**Description:** Add `PageParams`, `Page[T]` and `paginate()` (`COUNT(*) OVER()` with an empty-page fallback), and use them for the admin user list.
+
+**Acceptance criteria:**
+- [x] `GET /users?limit=&offset=` (admin) → `{items, total, limit, offset}`, ordered by `id`.
+- [x] `limit` outside 1..100 or a negative `offset` → 422 in the unified format.
+- [x] An offset past the end → `items: []` with the correct `total`.
+
+**Verification:**
+- [x] Assertions added to `test_admin_manages_users`: create 3 users → `limit=2` page 1 has 2 items with `total` = all users; an offset past the end → empty items, same total.
+- [x] Suite green; ruff + mypy clean.
+
+**Dependencies:** Task 13
+
+**Files likely touched:** `src/pagination.py`, `src/auth/router.py`, `src/auth/service.py`, `tests/auth/test_router.py`
+
+**Estimated scope:** Small
+
+---
+
+## Checkpoint A (after Task 14)
+- [x] Suite green; ruff + mypy clean
+
+---
+
+## Task 15: Warehouses: model + migration `0004` + create/list/get/patch
+
+**Description:** The warehouse domain package with CRUD minus delete. Any authenticated user can read; only admins can write.
+
+**Acceptance criteria:**
+- [x] `warehouse` table with timestamps; `location_code` unique (`warehouse_location_code_key`), trimmed and upper-cased.
+- [x] `POST /warehouses` (admin) → 201. Duplicate code → `409 location_code_taken` via `ON CONFLICT`.
+- [x] `GET /warehouses` (any user) is paginated with an optional `is_active` filter. `GET /warehouses/{warehouse_id}` → 200 / 404 `warehouse_not_found`.
+- [x] `PATCH /warehouses/{warehouse_id}` (admin): name, address, location_code, is_active.
+  - an empty body → 422
+  - a duplicate code → 409, via `IntegrityError` on the UPDATE
+  - an unknown id → 404
+
+**Verification:**
+- [x] `tests/warehouses/test_router.py::test_warehouse_crud`:
+  - create (normalized code)
+  - duplicate → 409
+  - storekeeper POST/PATCH → 403; storekeeper list/get → 200
+  - list filter `is_active=false` after deactivating one
+  - PATCH rename + code clash → 409
+  - unknown → 404
+- [x] Migration round-trip; suite green; ruff + mypy clean.
+
+**Dependencies:** Tasks 13, 14
+
+**Files likely touched:** `src/warehouses/{__init__,models,schemas,service,dependencies,exceptions,constants,router}.py`, `src/models.py`, `src/main.py`, `alembic/versions/2026-11-23_warehouse.py`, `tests/warehouses/{__init__,test_router}.py`
+
+**Estimated scope:** Medium
+
+---
+
+## Task 16: Products: model + migration `0005` + create/get/patch/soft-delete
+
+**Description:** The product domain package with an immutable SKU, a Decimal price and soft delete. Deleted products are invisible (404) and their SKUs stay reserved.
+
+**Acceptance criteria:**
+- [x] `product` table:
+  - `sku` unique (`product_sku_key`)
+  - `base_price` `Numeric(12,2)` with `product_base_price_non_negative_check`
+  - `min_stock_level` with `product_min_stock_level_non_negative_check`
+  - timestamps
+- [x] `POST /products` (admin) → 201 with `base_price` serialized as a string (`"12.50"`). A duplicate SKU, including one on a deleted product → `409 sku_taken`.
+- [x] `GET /products/{product_id}` (any user), `PATCH` (admin: name / base_price / min_stock_level; `sku` is not accepted) and `DELETE` (admin, soft → 204). A deleted or unknown product → 404 `product_not_found` on all three.
+
+**Verification:**
+- [x] `tests/products/test_router.py::test_product_crud`:
+  - create (SKU normalized, price string)
+  - invalid prices (negative, 3 decimals) → 422
+  - PATCH price
+  - storekeeper write → 403, read → 200
+  - DELETE → 204, then GET/PATCH/DELETE → 404
+  - recreate the same SKU → 409
+- [x] Migration round-trip + `alembic check`; suite green; ruff + mypy clean.
+
+**Dependencies:** Tasks 13, 14 (independent of 15)
+
+**Files likely touched:** `src/products/{__init__,models,schemas,service,dependencies,exceptions,constants,router}.py`, `src/models.py`, `src/main.py`, `alembic/versions/2026-11-23_product.py`, `tests/products/{__init__,test_router}.py`
+
+**Estimated scope:** Medium
+
+---
+
+## Checkpoint: Step 3 complete
+- [x] `uv run pytest` green; ruff + mypy clean; alembic round-trip + `alembic check`
+- [x] Compose: the seeded admin creates a warehouse + product via curl; a storekeeper reads OK, writes 403
+- [x] Commit (no self-credit); human review, then plan Step 4

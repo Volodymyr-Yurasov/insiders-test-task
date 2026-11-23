@@ -277,7 +277,7 @@ deps + exceptions/ErrorCode + TimestampMixin + src/models.py registry
 - [x] `uv run pytest` green: 3 existing + 5 new test functions (login, access matrix, refresh, user update, seed)
 - [x] ruff + mypy clean; alembic `base ↔ head` round-trip; `alembic check` reports no diff
 - [x] Compose: log in as the seeded admin via curl → access works → refresh works → logout → the refresh token is rejected. `docker compose restart api` → healthy, still one admin.
-- [ ] Human review, then plan Step 3
+- [x] Human review: approved 2026-11-23 (committed a69153b)
 
 ## Risks and Mitigations
 | Risk | Impact | Mitigation |
@@ -290,3 +290,98 @@ deps + exceptions/ErrorCode + TimestampMixin + src/models.py registry
 | `updated_at` silently not bumped | Low | `onupdate` on the mixin; no raw-text UPDATEs. The T11 test asserts `updated_at` advanced. |
 | Argon2 slows the suite | Low | Users are created through the service. Tokens for fixtures are minted directly, not via login. |
 | Seeding overwrites a rotated admin password | Med | `ON CONFLICT DO NOTHING`; tested. |
+
+---
+
+# Implementation Plan: Step 3 — Unified errors, pagination, warehouses & products
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 3, conventions C1–C12, decisions D8–D10.
+
+## Overview
+Make every error response share one shape, add the pagination foundation, and build the catalog domains that movements will reference: warehouses and products.
+
+New endpoints:
+
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| GET | `/users` | admin | paginated (closes the Step 2 gap) |
+| POST | `/warehouses` | admin | `ON CONFLICT (location_code)` → 409 |
+| GET | `/warehouses` | any user | paginated, optional `is_active` filter |
+| GET | `/warehouses/{warehouse_id}` | any user | |
+| PATCH | `/warehouses/{warehouse_id}` | admin | name, address, location_code, is_active |
+| POST | `/products` | admin | `ON CONFLICT (sku)` → 409 |
+| GET | `/products/{product_id}` | any user | 404 if soft-deleted; the stock breakdown is added in Step 4 |
+| PATCH | `/products/{product_id}` | admin | name, base_price, min_stock_level; **SKU immutable** |
+| DELETE | `/products/{product_id}` | admin | soft delete → 204; already deleted → 404 |
+
+`GET /products` (list with stock, filters, sort) is **Step 5**, since it's the aggregation endpoint.
+
+## Architecture Decisions
+- **Unified error format (fixes the Step 2 gap)** in `src/exceptions.py`:
+  - `RequestValidationError` → `422 {"code": "validation_error", "detail": "Request validation failed", "errors": [{"loc", "msg", "type"}]}`.
+  - Starlette `HTTPException` (unknown route, 405, FastAPI internals) → `{"code": <by status: not_found | method_not_allowed | http_error>, "detail": exc.detail}`, keeping `exc.headers` (e.g. `Allow`).
+  - Unhandled `Exception` → `500 {"code": "internal_error", "detail": "Internal server error"}`, logged with traceback. No internals leak to the client.
+  - The existing Step 2 test that reads `detail[...].loc` switches to `errors`.
+- **Pagination** (`src/pagination.py`):
+  - `PageParams` is a dependency: `limit: Query(20, ge=1, le=100)`, `offset: Query(0, ge=0)`.
+  - `Page[T]` is a generic response model.
+  - `paginate(db, stmt, params)` adds `COUNT(*) OVER()` to the same SELECT, so the page and total come from one snapshot. Only when an offset past the end returns no rows does it run a separate `COUNT(*)`.
+  - Ordering is the caller's job, always with a unique tie-breaker (`id`).
+- **Auth wiring:**
+  - Domain routers are `APIRouter(dependencies=[Depends(current_user)])`, so every route needs a logged-in user.
+  - Write routes add `dependencies=[Depends(admin_user)]` on the decorator.
+  - Admins therefore pass every check, and a storekeeper gets 403 on writes.
+- **Warehouse** (`src/warehouses/`):
+  - `warehouse`: `id`, `name` (1..255), `location_code` (unique; trim + upper-case; `^[A-Z0-9][A-Z0-9_-]{0,31}$`), `address` (1..500, required), `is_active`, timestamps. Migration `0004`.
+  - `valid_warehouse_id` dependency → 404 `warehouse_not_found`.
+  - Inactive warehouses stay readable; the list can filter by `is_active`.
+- **Product** (`src/products/`):
+  - `product`:
+    - `id`, `sku` (unique **including soft-deleted** per D9; trim + upper-case; `^[A-Z0-9][A-Z0-9._-]{0,63}$`), `name`, `is_deleted`, timestamps
+    - `base_price` `Numeric(12,2)` with `CHECK >= 0`
+    - `min_stock_level` `Integer` with `CHECK >= 0`
+    - Migration `0005`.
+  - `base_price`:
+    - Input: a `Decimal` with `ge=0`, `max_digits=12`, `decimal_places=2`. So `10.005` → 422, and floats are accepted without binary rounding.
+    - Output: a JSON **string** (Pydantic v2's default for Decimal), as D10 requires.
+  - `valid_product_id` (exists and not deleted) → 404 `product_not_found`. Deleted products look gone everywhere.
+  - Duplicate SKU → `409 sku_taken`, "SKU already exists (possibly on a deleted product)", so the client understands why a "missing" SKU still conflicts.
+  - **SKU is immutable.** The batch API identifies products by SKU, and the spec calls it the unique article number. Renaming is better modeled as a new product. This also leaves product PATCH with no unique field, so no `IntegrityError` path.
+- **PATCH semantics:** same as users: all fields optional, omitted/null = unchanged, an empty body → 422. No nullable domain fields exist, so null never means "clear".
+- **String hygiene:** `name`/`address` are trimmed per field. There's no global `str_strip_whitespace`, because that would silently strip leading/trailing spaces from passwords.
+- **D8 guards deferred to Step 4.** Stock = 0 checks need the movement ledger. Until then, deactivate and soft-delete are unconditional; PLAN.md Step 4 carries the task.
+- **Future hooks (not built now):** price changes and product/warehouse create/delete must invalidate the valuation cache (Step 6). Each service function gets a single `# Step 6: invalidate valuation cache` marker at its commit point.
+
+## Dependency Graph
+```
+T13 unified error handlers ─────────────┐
+T14 pagination + GET /users ─────────────┤ (both used by)
+                                         ├── T15 warehouses (model 0004, CRUD, list)
+                                         └── T16 products   (model 0005, CRUD, soft delete)
+```
+T15 and T16 are independent of each other; both are sequenced after T13/T14.
+
+## Task List
+- [x] Task 13: Unified error format for FastAPI/Starlette/unhandled errors
+- [x] Task 14: Pagination foundation + `GET /users`
+
+### Checkpoint A (after T14)
+- [x] Suite green; ruff + mypy clean
+
+- [x] Task 15: Warehouses: model + migration `0004` + create/list/get/patch
+- [x] Task 16: Products: model + migration `0005` + create/get/patch/soft-delete
+
+### Checkpoint: Step 3 complete
+- [x] `uv run pytest` green (18 existing + 3 new test functions); ruff + mypy clean
+- [x] Alembic `base ↔ head` round-trip; `alembic check` no diff
+- [x] Compose: as the seeded admin, create a warehouse and a product via curl; a storekeeper can read them but gets 403 on writes
+- [x] Commit (no self-credit); human review, then plan Step 4
+
+## Risks and Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| The `Exception` handler makes tests raise instead of returning a 500 (`ASGITransport` re-raises by default) | Med | Don't test the 500 path through the client; unit-test the handler function, or skip it. The 422/404/405 paths are tested via HTTP. |
+| `COUNT(*) OVER()` gives no total when the page is empty | Low | Fallback `COUNT(*)` only when no rows come back; covered by a "page past the end" assertion. |
+| Decimal precision / float input surprises (`0.1 + 0.2`) | Med | `Numeric(12,2)` + a `decimal_places=2` validator; asserted as string output `"12.50"`. |
+| Deleted SKU reuse confuses API users | Low | 409 message names the possibility explicitly; D9 documented in the README later. |
+| Catalog writes forget cache invalidation in Step 6 | Med | Explicit marker comments at each commit point; Step 6 plan greps for them. |

@@ -1,11 +1,11 @@
 from datetime import datetime
-from typing import Annotated, Any, Literal, Self
+from typing import Annotated, Literal
 
-from pydantic import BeforeValidator, Field, StringConstraints, model_validator
+from pydantic import BeforeValidator, Field, StringConstraints
 
 from src.auth.constants import Role
 from src.auth.utils import normalize_username
-from src.schemas import CustomModel
+from src.schemas import CustomModel, PatchModel
 
 
 def _normalize(value: object) -> object:
@@ -37,22 +37,11 @@ class UserCreate(CustomModel):
     role: Role
 
 
-class UserUpdate(CustomModel):
-    """Partial update. Omitted or null fields are left unchanged."""
-
+class UserUpdate(PatchModel):
     username: Username | None = None
     role: Role | None = None
     password: Password | None = None
     is_active: bool | None = None
-
-    @model_validator(mode="after")
-    def _not_empty(self) -> Self:
-        if not self.changes():
-            raise ValueError("Provide at least one field to update")
-        return self
-
-    def changes(self) -> dict[str, Any]:
-        return self.model_dump(exclude_none=True)
 
 
 class UserRead(CustomModel):

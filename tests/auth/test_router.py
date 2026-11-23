@@ -143,12 +143,27 @@ async def test_admin_manages_users(client: AsyncClient, admin_headers: dict[str,
         json={"username": "x", "password": "short", "role": "superuser"},
     )
     assert invalid.status_code == 422
-    assert {e["loc"][-1] for e in invalid.json()["detail"]} == {"username", "password", "role"}
+    assert {e["loc"][-1] for e in invalid.json()["errors"]} == {"username", "password", "role"}
 
     fetched = await client.get(f"/users/{user['id']}", headers=admin_headers)
     assert fetched.status_code == 200 and fetched.json() == user
     missing = await client.get("/users/999999", headers=admin_headers)
     assert missing.status_code == 404 and missing.json()["code"] == "user_not_found"
+
+    # Pagination: the admin fixture + "new.keeper" + 2 more = 4 users, ordered by id.
+    for name in ("third", "fourth"):
+        await client.post(
+            "/users",
+            headers=admin_headers,
+            json={"username": name, "password": "password123", "role": "storekeeper"},
+        )
+    first_page = (await client.get("/users?limit=2", headers=admin_headers)).json()
+    assert first_page["total"] == 4 and first_page["limit"] == 2 and first_page["offset"] == 0
+    assert [u["id"] for u in first_page["items"]] == sorted(u["id"] for u in first_page["items"])
+    assert len(first_page["items"]) == 2
+    past_end = (await client.get("/users?offset=50", headers=admin_headers)).json()
+    assert past_end["items"] == [] and past_end["total"] == 4
+    assert (await client.get("/users?limit=0", headers=admin_headers)).status_code == 422
 
 
 async def test_refresh_rotation(client: AsyncClient, create_user: CreateUser) -> None:

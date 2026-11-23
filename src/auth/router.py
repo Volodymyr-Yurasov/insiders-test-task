@@ -1,7 +1,8 @@
-from typing import Annotated
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, status
 from fastapi.security import OAuth2PasswordRequestForm
+from sqlalchemy import select
 
 from src.auth import service as auth_service
 from src.auth.dependencies import CurrentUser, admin_user, valid_user_id
@@ -9,6 +10,7 @@ from src.auth.exceptions import InvalidCredentials, UsernameTaken
 from src.auth.models import AppUser
 from src.auth.schemas import RefreshRequest, TokenPair, UserCreate, UserRead, UserUpdate
 from src.database import DbSession
+from src.pagination import Page, Pagination, paginate
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -74,6 +76,11 @@ async def create_user(body: UserCreate, db: DbSession) -> AppUser:
     if user is None:
         raise UsernameTaken()
     return user
+
+
+@users_router.get("", response_model=Page[UserRead], summary="List users (admin)")
+async def list_users(db: DbSession, page: Pagination) -> dict[str, Any]:
+    return await paginate(db, select(AppUser).order_by(AppUser.id), page)
 
 
 @users_router.get(
