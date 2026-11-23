@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Annotated, Any
 
-from fastapi import APIRouter, BackgroundTasks, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Response, status
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from redis.asyncio import Redis
@@ -25,6 +25,8 @@ from src.notifications import service as notifications_service
 from src.notifications.dependencies import NotifierDep
 from src.notifications.service import Notifier
 from src.pagination import Page, Pagination
+from src.rate_limit import service as rate_limit_service
+from src.rate_limit.exceptions import RateLimited
 from src.redis import get_redis
 from src.reports.dependencies import ValuationCache
 
@@ -33,6 +35,7 @@ router = APIRouter(prefix="/movements", tags=["movements"], dependencies=[Depend
 
 ERRORS: dict[int | str, dict[str, Any]] = {
     404: {"description": "Unknown warehouse, or unknown/deleted SKUs (all listed)"},
+    429: {"description": "More than the allowed transactions per minute; see Retry-After"},
     409: {
         "description": "Insufficient stock (every shortage listed), inactive warehouse, "
         "or the same Idempotency-Key is still in flight"
@@ -78,6 +81,7 @@ class _WriteContext:
     valuation_cache: ValuationCache
     notifier: Notifier
     background_tasks: BackgroundTasks
+    response: Response
     idempotency_key: str | None
 
 
@@ -88,10 +92,11 @@ async def _write_context(
     valuation_cache: ValuationCache,
     notifier: NotifierDep,
     background_tasks: BackgroundTasks,
+    response: Response,
     idempotency_key: IdempotencyKey = None,
 ) -> _WriteContext:
     return _WriteContext(
-        user.id, db, redis, valuation_cache, notifier, background_tasks, idempotency_key
+        user.id, db, redis, valuation_cache, notifier, background_tasks, response, idempotency_key
     )
 
 
@@ -157,6 +162,16 @@ async def _record(
         if isinstance(decision, idempotency_service.Replay):
             return _replayed(decision.status_code, decision.body)
         token = decision.token
+
+    # Rate limit AFTER the replay check (replays write nothing and cost no quota) and BEFORE
+    # the engine (failed business attempts still count: the limit protects the system).
+    limit = await rate_limit_service.hit(ctx.redis, ctx.user_id)
+    if not limit.allowed:
+        if key is not None and token is not None:
+            await idempotency_service.release(ctx.redis, ctx.user_id, key, token)
+        raise RateLimited(limit.retry_after_s)
+    ctx.response.headers["X-RateLimit-Limit"] = str(limit.limit)
+    ctx.response.headers["X-RateLimit-Remaining"] = str(limit.remaining)
 
     try:
         result = await movements_service.execute(ctx.db, ctx.user_id, build(key, request_fp))

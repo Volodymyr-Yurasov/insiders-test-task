@@ -756,3 +756,22 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
 ## Checkpoint: Step 8 complete
 - [x] Suite green; ruff + mypy clean; alembic check; compose replay
 - [x] Commit (no self-credit)
+
+---
+---
+
+# Todo — Step 9: Sliding-window rate limiting
+
+## Task 33: Limiter + wiring
+- [x] `src/rate_limit/{config,constants,exceptions,service}.py`: atomic Lua sliding window (Redis `TIME`, unique members, PEXPIRE), `hit(redis, user_id)` → `Decision(allowed, remaining, retry_after_s)`, fail-open on RedisError
+- [x] `_record`: after the idempotency replay check, before the engine; a deny releases the idempotency marker; `X-RateLimit-*` headers via the injected `Response`
+
+## Task 34: Tests (`tests/rate_limit/test_rate_limit.py`)
+- [x] `test_rate_limit_per_user` (429 + Retry-After, other user OK, GETs OK, batch counts once, replay not counted)
+- [x] `test_concurrent_requests_respect_the_limit` (exactly *limit* of 10 pass)
+- [x] `test_window_slides_and_releases_idempotency_key` (1 s window)
+- [x] `test_fail_open_when_redis_is_down`
+
+## Checkpoint: Step 9 complete
+- [x] Suite green; ruff + mypy clean; compose 429 on the 51st request
+- [x] Commit (no self-credit)

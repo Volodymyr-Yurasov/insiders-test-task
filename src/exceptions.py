@@ -24,8 +24,11 @@ class DetailedHTTPException(Exception):
     DETAIL: ClassVar[str] = "Server error"
     HEADERS: ClassVar[dict[str, str] | None] = None
 
-    def __init__(self, detail: str | None = None, **extra: Any) -> None:
+    def __init__(
+        self, detail: str | None = None, *, headers: dict[str, str] | None = None, **extra: Any
+    ) -> None:
         self.detail = detail or self.DETAIL
+        self.headers = headers or self.HEADERS  # per-instance override (e.g. Retry-After)
         self.extra = extra
         super().__init__(self.detail)
 
@@ -80,7 +83,7 @@ def _error(
 
 async def _detailed_exception_handler(_: Request, exc: Exception) -> JSONResponse:
     assert isinstance(exc, DetailedHTTPException)
-    return _error(exc.STATUS_CODE, exc.CODE, exc.detail, headers=exc.HEADERS, **exc.extra)
+    return _error(exc.STATUS_CODE, exc.CODE, exc.detail, headers=exc.headers, **exc.extra)
 
 
 async def _validation_exception_handler(_: Request, exc: Exception) -> JSONResponse:

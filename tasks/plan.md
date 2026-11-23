@@ -720,3 +720,40 @@ Parent plan: [../PLAN.md](../PLAN.md) Step 8. Bonus spec: support an `Idempotenc
 ### Checkpoint: Step 8 complete
 - [x] Suite green; ruff + mypy clean; alembic check; compose replay via curl
 - [x] Commit (no self-credit)
+
+---
+
+# Implementation Plan: Step 9 — Sliding-window rate limiting (bonus 2)
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 9. Bonus spec: at most 50 transactions per minute per employee, enforced through Redis with a sliding-window algorithm.
+
+## Architecture Decisions
+- **What counts:** every movement write attempt (`POST /movements`, `POST /movements/batch`).
+  - A batch is **one** transaction (one DB transaction).
+  - Failed business attempts (e.g. 409 insufficient stock) count too: the limit protects the system.
+  - **Idempotent replays don't count** and are served even while the user is limited: they write nothing.
+  - Reads are not limited.
+- **Algorithm:** a sliding-window log, one ZSET per user (`rl:{user_id}`), in **one Lua script** so check-and-add is atomic (no two requests can both see 49):
+  1. `now` = Redis `TIME` in ms. A single clock, so several API instances with skewed clocks agree.
+  2. `ZREMRANGEBYSCORE key -inf now-window`.
+  3. `ZCARD`.
+  4. If below the limit: `ZADD now <uuid>` (a unique member, so two requests in the same millisecond don't merge) + `PEXPIRE window` → allowed, return the remaining count.
+  5. Otherwise deny with `retry_after = oldest + window - now`.
+- **Order in `_record`:** auth → idempotency `begin` (replays return here, quota untouched) → **rate limit** → engine. On a deny, the idempotency marker that was just claimed is released, so a later retry with the same key runs normally.
+- **Responses:**
+  - Allowed: `X-RateLimit-Limit` / `X-RateLimit-Remaining` headers.
+  - Denied: `429 {"code": "rate_limited"}` + `Retry-After` (seconds, rounded up, ≥ 1).
+- **Redis down → fail open,** with an error log. Availability of stock operations wins over the limiter.
+- **Config:** `RATE_LIMIT_MAX_REQUESTS = 50` and `RATE_LIMIT_WINDOW_S = 60`. Tests patch the settings object.
+
+## Task List
+- [x] Task 33: `src/rate_limit/` (Lua sliding window, config, 429 exception) + wiring in `_record` + headers
+- [x] Task 34: Tests:
+  - limit reached → 429 + `Retry-After`; per user; reads unaffected; batch = 1; replay served while limited and not counted
+  - concurrency: exactly *limit* of N parallel requests pass (atomicity)
+  - the window slides (short window) and a 429 releases the idempotency key
+  - Redis down → fail open
+
+### Checkpoint: Step 9 complete
+- [x] Suite green; ruff + mypy clean; compose: 51st request in a minute → 429
+- [x] Commit (no self-credit)
