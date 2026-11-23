@@ -1,0 +1,3 @@
+# Keep LF everywhere (files run inside Linux containers); binaries untouched.
+* text=auto eol=lf
+*.docx binary
