@@ -1,8 +1,15 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Annotated
+from typing import Annotated, Literal, Self
 
-from pydantic import AfterValidator, BeforeValidator, ConfigDict, Field, StringConstraints
+from pydantic import (
+    AfterValidator,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    model_validator,
+)
 
 from src.schemas import CustomModel, PatchModel
 
@@ -54,6 +61,34 @@ class ProductRead(CustomModel):
     min_stock_level: int
     created_at: datetime
     updated_at: datetime
+
+
+class ProductListItem(ProductRead):
+    # Total across warehouses, or the stock in `warehouse_id` when that filter is given.
+    stock: int
+
+
+class ProductListQuery(CustomModel):
+    """Query parameters of GET /products, validated before any SQL runs."""
+
+    search: Annotated[str | None, Field(min_length=1, max_length=100)] = None
+    min_price: Annotated[Decimal | None, Field(ge=0)] = None
+    max_price: Annotated[Decimal | None, Field(ge=0)] = None
+    min_stock: Annotated[int | None, Field(ge=0)] = None
+    max_stock: Annotated[int | None, Field(ge=0)] = None
+    below_min_stock: bool = False
+    warehouse_id: int | None = None
+    # Literal whitelist: the sort key is never interpolated into SQL.
+    sort: Literal["id", "sku", "name", "price", "stock"] = "id"
+    order: Literal["asc", "desc"] = "asc"
+
+    @model_validator(mode="after")
+    def _ranges(self) -> Self:
+        for low, high in (("min_price", "max_price"), ("min_stock", "max_stock")):
+            low_value, high_value = getattr(self, low), getattr(self, high)
+            if low_value is not None and high_value is not None and low_value > high_value:
+                raise ValueError(f"{low} must not exceed {high}")
+        return self
 
 
 class WarehouseStock(CustomModel):

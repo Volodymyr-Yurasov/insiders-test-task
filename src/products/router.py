@@ -1,13 +1,22 @@
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, Depends, Query, status
 
 from src.auth.dependencies import admin_user, current_user
 from src.database import DbSession
+from src.pagination import Page, Pagination
 from src.products import service as products_service
 from src.products.dependencies import ValidProduct
 from src.products.models import Product
-from src.products.schemas import ProductCreate, ProductDetail, ProductRead, ProductUpdate
+from src.products.schemas import (
+    ProductCreate,
+    ProductDetail,
+    ProductListItem,
+    ProductListQuery,
+    ProductRead,
+    ProductUpdate,
+)
+from src.warehouses.dependencies import valid_warehouse_id
 
 # Every route needs a logged-in user; write routes additionally require admin.
 router = APIRouter(prefix="/products", tags=["products"], dependencies=[Depends(current_user)])
@@ -27,6 +36,24 @@ NOT_FOUND: dict[int | str, dict[str, Any]] = {
 )
 async def create_product(body: ProductCreate, db: DbSession) -> Product:
     return await products_service.create_product(db, body)
+
+
+@router.get(
+    "",
+    response_model=Page[ProductListItem],
+    summary="List products with computed stock (filter, sort, paginate)",
+    description=(
+        "`stock` is the total across warehouses, or the stock in `warehouse_id` when given "
+        "(`below_min_stock` then compares that warehouse's stock). One SQL statement."
+    ),
+    responses={404: {"description": "warehouse_id not found"}},
+)
+async def list_products(
+    query: Annotated[ProductListQuery, Query()], page: Pagination, db: DbSession
+) -> dict[str, Any]:
+    if query.warehouse_id is not None:
+        await valid_warehouse_id(query.warehouse_id, db)
+    return await products_service.list_products(db, query, page)
 
 
 @router.get(

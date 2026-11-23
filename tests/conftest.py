@@ -32,8 +32,10 @@ os.environ["ENVIRONMENT"] = "local"
 os.environ["JWT_SECRET"] = "test-secret-not-for-production-0123456789abcdef"
 
 import asyncio  # noqa: E402
-from collections.abc import AsyncIterator, Awaitable, Callable  # noqa: E402
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator  # noqa: E402
+from contextlib import contextmanager  # noqa: E402
 from decimal import Decimal  # noqa: E402
+from typing import Any  # noqa: E402
 from uuid import uuid4  # noqa: E402
 
 import asyncpg  # noqa: E402
@@ -42,7 +44,7 @@ from alembic import command  # noqa: E402
 from alembic.config import Config as AlembicConfig  # noqa: E402
 from fastapi import FastAPI  # noqa: E402
 from httpx import ASGITransport, AsyncClient  # noqa: E402
-from sqlalchemy import func, select, text  # noqa: E402
+from sqlalchemy import event, func, select, text  # noqa: E402
 
 from src.auth import service as auth_service  # noqa: E402
 from src.auth import utils as auth_utils  # noqa: E402
@@ -198,6 +200,22 @@ def make_product(app: FastAPI) -> MakeProduct:
             return await products_service.create_product(db, data)
 
     return _make
+
+
+@contextmanager
+def count_statements(app: FastAPI) -> Iterator[list[str]]:
+    """Record every SQL statement the app engine executes inside the block (N+1 guard)."""
+    statements: list[str] = []
+
+    def _record(*args: Any) -> None:
+        statements.append(args[2])  # (conn, cursor, statement, parameters, context, executemany)
+
+    sync_engine = app.state.engine.sync_engine
+    event.listen(sync_engine, "before_cursor_execute", _record)
+    try:
+        yield statements
+    finally:
+        event.remove(sync_engine, "before_cursor_execute", _record)
 
 
 async def count_movements(app: FastAPI) -> int:

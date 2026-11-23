@@ -14,6 +14,7 @@ from src.health import router as health_router
 from src.movements import router as movements_router
 from src.products import router as products_router
 from src.redis import create_redis
+from src.reports import router as reports_router
 from src.warehouses import router as warehouses_router
 
 # Application loggers (e.g. seed, notifications) at INFO; no-op if logging is already set up.
@@ -50,6 +51,7 @@ def create_app() -> FastAPI:
     app.include_router(warehouses_router.router)
     app.include_router(products_router.router)
     app.include_router(movements_router.router)
+    app.include_router(reports_router.router)
     return app
 
 

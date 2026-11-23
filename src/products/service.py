@@ -1,13 +1,89 @@
-from sqlalchemy import JSON, func, literal_column, select
+from typing import Any
+
+from sqlalchemy import JSON, asc, desc, func, literal_column, or_, select
 from sqlalchemy.dialects.postgresql import aggregate_order_by, insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from src.movements import stock as movements_stock
 from src.movements.models import StockMovement
+from src.pagination import PageParams, paginate
 from src.products.exceptions import ProductHasStock, ProductNotFound, SkuTaken
 from src.products.models import Product
-from src.products.schemas import ProductCreate, ProductDetail, ProductRead, ProductUpdate
+from src.products.schemas import (
+    ProductCreate,
+    ProductDetail,
+    ProductListQuery,
+    ProductRead,
+    ProductUpdate,
+)
+from src.utils import LIKE_ESCAPE, escape_like
 from src.warehouses.models import Warehouse
+
+
+async def list_products(
+    db: AsyncSession, query: ProductListQuery, page: PageParams
+) -> dict[str, Any]:
+    """Products with computed stock: ONE statement (spec 2.3, no N+1).
+
+    The ledger is pre-aggregated per product (total, or net in one warehouse via FILTER),
+    LEFT JOINed so products without movements get COALESCE(.., 0), then filtered, sorted
+    (whitelisted key + id tie-breaker) and paginated with COUNT(*) OVER() for the total.
+    """
+    w = query.warehouse_id
+    per_product = select(
+        StockMovement.product_id,
+        (
+            movements_stock.signed_total() if w is None else movements_stock.net_in_warehouse(w)
+        ).label("stock"),
+    ).group_by(StockMovement.product_id)
+    if w is not None:
+        per_product = per_product.where(movements_stock.touches_warehouse(w))
+    ledger = per_product.subquery("per_product")
+    stock = func.coalesce(ledger.c.stock, 0)
+
+    stmt = (
+        select(
+            Product.id,
+            Product.sku,
+            Product.name,
+            Product.base_price,
+            Product.min_stock_level,
+            Product.created_at,
+            Product.updated_at,
+            stock.label("stock"),
+        )
+        .outerjoin(ledger, ledger.c.product_id == Product.id)
+        .where(Product.is_deleted.is_(False))
+    )
+    if query.search is not None:
+        pattern = f"%{escape_like(query.search)}%"
+        stmt = stmt.where(
+            or_(
+                Product.sku.ilike(pattern, escape=LIKE_ESCAPE),
+                Product.name.ilike(pattern, escape=LIKE_ESCAPE),
+            )
+        )
+    if query.min_price is not None:
+        stmt = stmt.where(Product.base_price >= query.min_price)
+    if query.max_price is not None:
+        stmt = stmt.where(Product.base_price <= query.max_price)
+    if query.min_stock is not None:
+        stmt = stmt.where(stock >= query.min_stock)
+    if query.max_stock is not None:
+        stmt = stmt.where(stock <= query.max_stock)
+    if query.below_min_stock:
+        stmt = stmt.where(stock < Product.min_stock_level)
+
+    sort_column = {
+        "id": Product.id,
+        "sku": Product.sku,
+        "name": Product.name,
+        "price": Product.base_price,
+        "stock": stock,
+    }[query.sort]
+    direction = asc if query.order == "asc" else desc
+    stmt = stmt.order_by(direction(sort_column), direction(Product.id))
+    return await paginate(db, stmt, page)
 
 
 async def get_product_detail(db: AsyncSession, product_id: int) -> ProductDetail:

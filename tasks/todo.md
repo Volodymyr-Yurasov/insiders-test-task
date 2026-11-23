@@ -591,3 +591,94 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
   - oversell → 409 with shortages
   - deactivating a non-empty warehouse → 409
 - [x] Commit (no self-credit); human review, then plan Step 5
+
+---
+---
+
+# Todo — Step 5: SQL aggregations without N+1
+
+## Task 21: `GET /products`: list with stock, filters, sorting, pagination
+
+**Description:** List non-deleted products with their computed stock (total, or in one warehouse), filtered, sorted and paginated, from a single SQL statement.
+
+**Acceptance criteria:**
+- [x] One statement: the ledger pre-aggregated per product, LEFT JOINed, with `COALESCE(stock, 0)` and `COUNT(*) OVER()`. Deleted products are excluded.
+- [x] Query model:
+  - `search` (escaped ILIKE on SKU/name)
+  - `min_price` / `max_price`, `min_stock` / `max_stock` (`min > max` → 422)
+  - `below_min_stock`
+  - `warehouse_id` (unknown → 404)
+  - `sort` ∈ {id, sku, name, price, stock}, `order` ∈ {asc, desc}; anything else → 422
+- [x] Ordering always ends with `p.id` in the same direction. The response is `Page[ProductListItem]` with `stock`.
+
+**Verification:**
+- [x] `tests/products/test_list.py::test_product_list` with 4 products × 2 warehouses:
+  - sort by stock desc and by price asc
+  - page 2 of `limit=2`
+  - `min_stock` / `max_price` / `below_min_stock` filters
+  - `warehouse_id` switches to per-warehouse stock
+  - a search for a literal `_` doesn't act as a wildcard
+  - deleted products are absent
+  - bad `sort` / `min > max` → 422
+- [x] ruff + mypy clean; suite green.
+
+**Dependencies:** Step 4
+
+**Files likely touched:** `src/products/{schemas,service,router}.py`, `tests/products/test_list.py`
+
+**Estimated scope:** Medium
+
+---
+
+## Task 22: `GET /reports/valuation`: one-query valuation, admin-only
+
+**Description:** A new `reports` package. Per-warehouse value = Σ(stock × current base price) and units, computed in one statement (LEFT JOINs + SUM(CASE…) + COALESCE), plus a grand total and `generated_at`.
+
+**Acceptance criteria:**
+- [x] Every warehouse is listed: `{warehouse_id, name, location_code, is_active, total_units, total_value}`. An empty one shows `"0.00"` / 0.
+- [x] `grand_total` = Σ `total_value` (Decimal, `"X.XX"` string), plus `generated_at`. One data statement.
+- [x] Admin only (router-level dependency): storekeeper → 403, anonymous → 401.
+
+**Verification:**
+- [x] `tests/reports/test_valuation.py::test_valuation`: exact Decimal values for 2 stocked warehouses, after a TRANSFER and an OUT; an empty warehouse is `0.00`; an inactive (empty) one is flagged; a price change is reflected in the next call; storekeeper → 403.
+- [x] `EXPLAIN` reviewed; ruff + mypy clean; suite green.
+
+**Dependencies:** Step 4 (independent of Task 21)
+
+**Files likely touched:** `src/reports/{__init__,schemas,service,router}.py`, `src/main.py`, `tests/reports/{__init__,test_valuation}.py`
+
+**Estimated scope:** Small–Medium
+
+---
+
+**EXPLAIN notes (300k movements, 2k products, 50 warehouses; test DB, seeded then wiped):**
+- `GET /products` (total, sort by stock): parallel seq scan → partial/finalize HashAggregate per product → hash join product → WindowAgg (`COUNT(*) OVER`) → top-N sort. **67 ms.**
+- `GET /products?warehouse_id=`: BitmapOr on `from_`/`to_warehouse_id` indexes → HashAggregate → hash join. **17 ms.**
+- `GET /reports/valuation`: nested loop over 50 warehouses, each a BitmapOr index scan + hash join to product → GroupAggregate. **360–400 ms.**
+  - The pre-aggregated alternative (integer sum per (warehouse, product), then × price) measured **390–440 ms**, with identical results (0 mismatches). Kept the original.
+  - The cost is the 400k-row numeric aggregation itself, not the plan shape. Step 6's cache serves repeat calls.
+## Task 23: N+1 guard: statement-count fixture + scale-invariance test
+
+**Description:** Prove both aggregation endpoints run a constant number of SQL statements regardless of the data size.
+
+**Acceptance criteria:**
+- [x] A `count_statements` fixture (a `before_cursor_execute` listener on the app engine), usable as a context manager returning the count.
+- [x] `GET /products` and `GET /reports/valuation` each execute exactly *auth lookup + 1* statement, and the count is identical with 3 and with 12 products.
+
+**Verification:**
+- [x] `tests/test_n_plus_one.py::test_aggregations_use_constant_queries` green.
+- [x] Sanity check: temporarily computing stock per product in a Python loop makes the test fail; then reverted.
+
+**Dependencies:** Tasks 21, 22
+
+**Files likely touched:** `tests/conftest.py`, `tests/test_n_plus_one.py`
+
+**Estimated scope:** Small
+
+---
+
+## Checkpoint: Step 5 complete
+- [x] `uv run pytest` green; ruff + mypy clean
+- [x] `EXPLAIN` of both queries reviewed and noted
+- [x] Compose: product list sorted by stock + valuation via curl match the ledger
+- [x] Commit (no self-credit); human review, then plan Step 6

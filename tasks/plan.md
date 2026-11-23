@@ -496,3 +496,91 @@ T17 ledger tables (0006) + stock queries + POST /movements (IN only path)
 | A long lock wait hangs requests | Med | `SET LOCAL lock_timeout`, plus a deterministic test (hold the row lock in another session → 503). |
 | `json_agg` breakdown returns `null` for a product with no stock | Low | `COALESCE(json_agg(...), '[]')`; asserted. |
 | Ledger grows large → slow SUMs | Low (scale) | Composite indexes; snapshot+delta noted as a trade-off in PLAN.md §4. |
+
+---
+
+# Implementation Plan: Step 5 — SQL aggregations without N+1
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 5. Spec 2.3: the product list with computed stock (filter, sort by stock and price, paginate) and the financial valuation per warehouse, each from **one efficient SQL query** (COALESCE, SUM(CASE…), FILTER).
+
+## Overview
+| Method | Path | Who | Notes |
+|---|---|---|---|
+| GET | `/products` | any user | products + `stock`; filters, sorting, pagination; **1 data statement** |
+| GET | `/reports/valuation` | admin | per-warehouse value (stock × current base price) + grand total; **1 data statement** |
+
+## Architecture Decisions
+- **Product list query** (`products_service.list_products`):
+  ```sql
+  SELECT p.*, COALESCE(s.stock, 0) AS stock, COUNT(*) OVER () AS _total
+  FROM product p
+  LEFT JOIN (SELECT product_id, <stock aggregate> AS stock
+             FROM stock_movement [WHERE :w IN (from, to)]
+             GROUP BY product_id) s ON s.product_id = p.id
+  WHERE NOT p.is_deleted AND <filters>
+  ORDER BY <whitelisted sort> <dir>, p.id <dir>
+  LIMIT :limit OFFSET :offset
+  ```
+  - **Pre-aggregate, then join:** the ledger is grouped once by `product_id`, then LEFT JOINed. That's cheaper than joining every movement to its product and grouping by all product columns. Products without movements get stock 0 through `COALESCE`.
+  - Stock aggregate: without `warehouse_id` it's `SUM(CASE IN +q / OUT −q / TRANSFER 0)`, the total across warehouses. With `warehouse_id` it's `SUM(q) FILTER (to=:w) − SUM(q) FILTER (from=:w)`, the stock in that warehouse. Both reuse `movements/stock.py`.
+  - Stock filters go in the outer `WHERE` on `COALESCE(s.stock, 0)`, so no `HAVING` is needed and zero-stock products filter correctly.
+  - `total` comes from `COUNT(*) OVER()` in the same statement (Step 3 `paginate`).
+- **Query parameters** are a Pydantic query model (`Annotated[ProductListQuery, Query()]`), validated before any SQL:
+  - `search`: case-insensitive substring of `sku` or `name`, matched with `ILIKE` with `%`, `_` and `\` **escaped**, so a user's `%` or `_` matches literally instead of acting as a wildcard.
+  - `min_price` / `max_price` (Decimal ≥ 0) and `min_stock` / `max_stock` (int). `min > max` → 422.
+  - `below_min_stock: bool`: `stock < min_stock_level`, the same per-warehouse meaning when `warehouse_id` is given.
+  - `warehouse_id`: unknown → 404 (one extra PK lookup, only when the parameter is used).
+  - `sort ∈ {id, sku, name, price, stock}` (default `id`) and `order ∈ {asc, desc}`. Anything else → 422 from the `Literal` type, never interpolated. The `p.id` tie-breaker follows the same direction, so pages are stable.
+- **Response:** `Page[ProductListItem]`, where `ProductListItem` = `ProductRead` + `stock: int`. The field is named `stock`, not `total_stock`, because with `warehouse_id` it's the warehouse's stock.
+- **Valuation query** (`src/reports/`):
+  ```sql
+  SELECT w.id, w.name, w.location_code, w.is_active,
+         COALESCE(SUM(CASE WHEN m.to_warehouse_id = w.id THEN m.quantity
+                           ELSE -m.quantity END * p.base_price), 0)::numeric(20,2) AS total_value,
+         COALESCE(SUM(CASE WHEN m.to_warehouse_id = w.id THEN m.quantity
+                           ELSE -m.quantity END), 0) AS total_units
+  FROM warehouse w
+  LEFT JOIN stock_movement m ON w.id IN (m.from_warehouse_id, m.to_warehouse_id)
+  LEFT JOIN product p ON p.id = m.product_id
+  GROUP BY w.id ORDER BY w.id
+  ```
+  - Σ(movement qty × current price) = Σ(stock × price), because the price is fixed per product. So there's no intermediate per-product stock step, and it's still a single statement.
+  - The product join is a **LEFT JOIN**. An inner join would silently drop warehouses with no movements, and those must show `0.00`.
+  - `::numeric(20,2)`: empty warehouses render `"0.00"`, not `"0"`, and sums can't overflow `numeric(12,2)`.
+  - Deleted products contribute 0, since D8 guarantees their stock is zero everywhere. Inactive warehouses are listed with `is_active: false` (also 0 by D8).
+  - The `grand_total` is summed in Python from the same rows (Decimal), so there's no second query. `generated_at` is included, which Step 6 will need to show cache freshness.
+  - `/reports` router: `dependencies=[Depends(admin_user)]`, so the whole report router is admin-only (spec 2.6).
+  - I'll verify the plan with `EXPLAIN` during implementation. The expected shape is a nested loop over warehouses with a BitmapOr on the two warehouse indexes. If it degrades to a seq scan per warehouse, the fallback is to pre-aggregate the signed ledger per `(warehouse, product)` and join prices once.
+- **N+1 guard (test infrastructure):** a `count_statements` fixture hooks SQLAlchemy's `before_cursor_execute` on the app engine.
+  - The test asserts an **exact** count per request: 1 auth lookup + 1 data statement.
+  - It also asserts that the count is **identical with 3 and with 12 products**. A per-row query would make it grow, which is the real N+1 proof.
+- **Out of scope:** caching (Step 6). A marker goes where the valuation is computed.
+
+## Dependency Graph
+```
+movements/stock.py aggregates (Step 4) ─┬── T21 GET /products (list + filters + sort)
+pagination (Step 3) ────────────────────┤
+                                        └── T22 GET /reports/valuation
+T21 + T22 ── T23 statement-count fixture + N+1 test (both endpoints)
+```
+
+## Task List
+- [x] Task 21: `GET /products`: list with stock, filters, sorting, pagination
+- [x] Task 22: `GET /reports/valuation`: one-query valuation, admin-only
+- [x] Task 23: N+1 guard: statement-count fixture + scale-invariance test
+
+### Checkpoint: Step 5 complete
+- [x] `uv run pytest` green (29 existing + 3 new test functions); ruff + mypy clean
+- [x] `EXPLAIN` of both queries reviewed (index use, no per-row subplans); notes recorded in the task
+- [x] Compose: `GET /products?sort=stock&order=desc` and `GET /reports/valuation` via curl match the ledger
+- [x] Commit (no self-credit); human review, then plan Step 6
+
+## Risks and Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| LIKE wildcards in `search` (e.g. `50%`) match too much | Low | Escape `\`, `%`, `_` and use `ILIKE … ESCAPE '\'`; tested with a literal `_`. |
+| Sort by a stock value shared by many products → unstable pages | Med | Always add the `p.id` tie-breaker in the same direction; tested by paging through the sort. |
+| Inner join drops empty warehouses from the valuation | Med | LEFT JOINs + COALESCE; an empty warehouse is asserted as `"0.00"`. |
+| `0` vs `0.00` / numeric overflow in sums | Low | Cast to `numeric(20,2)`. |
+| The statement counter sees unrelated statements (pool pre-ping, auth) | Med | Assert exact numbers measured once **and** invariance across data sizes; document what each counted statement is. |
+| The `OR` join in the valuation scales poorly with many warehouses | Low | EXPLAIN check, with a documented pre-aggregation fallback. |
