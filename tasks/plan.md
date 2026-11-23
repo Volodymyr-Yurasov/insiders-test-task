@@ -584,3 +584,49 @@ T21 + T22 ── T23 statement-count fixture + N+1 test (both endpoints)
 | `0` vs `0.00` / numeric overflow in sums | Low | Cast to `numeric(20,2)`. |
 | The statement counter sees unrelated statements (pool pre-ping, auth) | Med | Assert exact numbers measured once **and** invariance across data sizes; document what each counted statement is. |
 | The `OR` join in the valuation scales poorly with many warehouses | Low | EXPLAIN check, with a documented pre-aggregation fallback. |
+
+---
+
+# Implementation Plan: Step 6 — Redis cache for the valuation report
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 6. Spec 2.4: the valuation result is cached in Redis and **consistently invalidated** when a new movement appears.
+
+## Architecture Decisions
+- **Generation counter, not DELETE** (`src/reports/cache.py`):
+  - Read `valuation:gen` (missing = 0), then `GET valuation:v:{gen}`.
+  - Hit → return it, with `X-Cache: HIT`.
+  - Invalidate = `INCR valuation:gen` **after** the DB commit.
+  - Why: a slow reader that computed pre-commit data stores it under the old generation, which nobody reads again. With DELETE, that stale value would be written back and served until the next movement.
+  - Why after commit: an INCR before commit could let a reader cache pre-commit data under the new generation.
+  - The generation is read **before** the DB query. If the data is newer than the generation, it's still correct to cache under it.
+- **Stampede guard:** on a miss, `SET valuation:lock:{gen} NX EX 5`.
+  - The winner computes, `SET valuation:v:{gen} … EX ttl`, and releases the lock.
+  - Losers poll the value key (50 ms steps, ~1 s max), then compute uncached. Correctness never depends on the lock.
+- **What invalidates:** every successful write to a table the report reads.
+  - Movements: single and batch.
+  - Products: create, patch (price), delete.
+  - Warehouses: create, patch (name, code, `is_active` all appear in the report).
+  - This is broader than "new movement" (the spec's minimum) because a price change or a warehouse rename would otherwise serve wrong data for the whole TTL.
+- **Where:** a `ValuationCache` dependency used in the **routers**, called after the service returns. Errors raise before reaching it, so a rolled-back request never invalidates. Services stay Redis-free.
+- **TTL:** `VALUATION_CACHE_TTL_S` (default 300) is a safety net, bounding staleness if an INCR is lost (Redis blip right after commit).
+- **Redis unavailable:**
+  - Reads fall back to computing from the DB (`X-Cache: BYPASS`).
+  - Invalidation failures are logged. The request still succeeds, since the DB commit already happened.
+- **Serialization:** `ValuationReport.model_dump_json()` / `model_validate_json()`; Decimals stay exact strings.
+
+## Task List
+- [x] Task 24: `reports/cache.py` (generation, stampede lock, fallback) + `X-Cache` header + `ValuationCache` dependency
+- [x] Task 25: Invalidation wired into every write route
+- [x] Task 26: Tests: hit/miss/invalidation/all write routes/Redis down; deterministic stale write-back race; stampede (1 compute for 10 concurrent cold requests)
+
+### Checkpoint: Step 6 complete
+- [x] Suite green; ruff + mypy clean; compose: MISS → HIT → movement → MISS with the new value
+- [x] Commit (no self-credit)
+
+## Risks and Mitigations
+| Risk | Impact | Mitigation |
+|------|--------|------------|
+| A write route forgets to invalidate | High | A test bumps every write endpoint and asserts the generation increased. |
+| Stale write-back race | High | Generation keys + a deterministic interleaving test. |
+| Redis outage breaks the report or the writes | Med | Every Redis call is wrapped; BYPASS read path; invalidation is log-only on failure; tested with an unreachable Redis. |
+| Thundering herd on a cold cache | Low | NX lock + bounded polling; tested (1 compute for 10 concurrent requests). |

@@ -682,3 +682,33 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
 - [x] `EXPLAIN` of both queries reviewed and noted
 - [x] Compose: product list sorted by stock + valuation via curl match the ledger
 - [x] Commit (no self-credit); human review, then plan Step 6
+
+---
+---
+
+# Todo — Step 6: Redis cache for the valuation report
+
+## Task 24: Cache module + `X-Cache` + dependency
+- [x] `get_or_compute(redis, compute)` → `(report, "HIT" | "MISS" | "BYPASS")`: generation keys, NX stampede lock with bounded polling, Redis errors → compute from DB
+- [x] `invalidate(redis)` = `INCR` generation, errors logged and swallowed
+- [x] `GET /reports/valuation` sets `X-Cache`; `ReportsConfig.VALUATION_CACHE_TTL_S` (300)
+- **Files:** `src/reports/{cache,config,dependencies,router}.py`
+
+## Task 25: Invalidate on every successful write
+- [x] Routers call `await valuation_cache.invalidate()` after: `POST /movements`, `POST /movements/batch`, `POST/PATCH/DELETE /products`, `POST/PATCH /warehouses`
+- **Files:** `src/{movements,products,warehouses}/router.py`
+
+## Task 26: Tests
+- [x] `tests/reports/test_cache.py`:
+  - `test_valuation_cache`:
+    - MISS → HIT (0 valuation statements on HIT)
+    - a movement → MISS with the new value
+    - every write route bumps the generation
+    - unreachable Redis → 200 `BYPASS`
+  - `test_stale_write_back_is_never_served`: deterministic interleaving via the cache functions
+  - `test_cold_cache_stampede_computes_once`: 10 concurrent GETs → the valuation query runs once
+- **Dependencies:** Tasks 24, 25
+
+## Checkpoint: Step 6 complete
+- [x] Suite green; ruff + mypy clean; compose MISS → HIT → movement → MISS
+- [x] Commit (no self-credit)

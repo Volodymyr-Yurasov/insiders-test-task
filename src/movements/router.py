@@ -14,6 +14,7 @@ from src.movements.schemas import (
     OperationRead,
 )
 from src.pagination import Page, Pagination
+from src.reports.dependencies import ValuationCache
 
 # Storekeepers and admins may both create movements (spec 2.6).
 router = APIRouter(prefix="/movements", tags=["movements"], dependencies=[Depends(current_user)])
@@ -58,8 +59,12 @@ async def list_movements(
     summary="Record one movement (IN / OUT / TRANSFER)",
     responses=ERRORS,
 )
-async def create_movement(body: MovementCreate, user: CurrentUser, db: DbSession) -> OperationRead:
-    return await movements_service.execute(db, user.id, movements_service.Command.single(body))
+async def create_movement(
+    body: MovementCreate, user: CurrentUser, db: DbSession, valuation_cache: ValuationCache
+) -> OperationRead:
+    operation = await movements_service.execute(db, user.id, movements_service.Command.single(body))
+    await valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
+    return operation
 
 
 @router.post(
@@ -73,5 +78,9 @@ async def create_movement(body: MovementCreate, user: CurrentUser, db: DbSession
     ),
     responses=ERRORS,
 )
-async def create_batch(body: BatchCreate, user: CurrentUser, db: DbSession) -> OperationRead:
-    return await movements_service.execute(db, user.id, movements_service.Command.batch(body))
+async def create_batch(
+    body: BatchCreate, user: CurrentUser, db: DbSession, valuation_cache: ValuationCache
+) -> OperationRead:
+    operation = await movements_service.execute(db, user.id, movements_service.Command.batch(body))
+    await valuation_cache.invalidate()
+    return operation

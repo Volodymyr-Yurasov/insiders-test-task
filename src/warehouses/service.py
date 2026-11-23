@@ -27,7 +27,6 @@ async def create_warehouse(db: AsyncSession, data: WarehouseCreate) -> Warehouse
     if warehouse is None:
         raise LocationCodeTaken()
     await db.commit()
-    # Step 6: invalidate valuation cache (a new warehouse appears in the report).
     return warehouse
 
 

@@ -44,7 +44,7 @@ def valuation_query() -> Select[int, str, str, bool, int, Decimal]:
 
 
 async def compute_valuation(db: AsyncSession) -> ValuationReport:
-    # Step 6: served from the Redis cache; this is the cache-miss path.
+    # The cache-miss path: the router serves this through src/reports/cache.py.
     rows = (await db.execute(valuation_query())).all()
     warehouses = [
         WarehouseValuation(

@@ -16,6 +16,7 @@ from src.products.schemas import (
     ProductRead,
     ProductUpdate,
 )
+from src.reports.dependencies import ValuationCache
 from src.warehouses.dependencies import valid_warehouse_id
 
 # Every route needs a logged-in user; write routes additionally require admin.
@@ -34,8 +35,12 @@ NOT_FOUND: dict[int | str, dict[str, Any]] = {
     summary="Create a product (admin)",
     responses={409: {"description": "SKU already exists, possibly on a deleted product"}},
 )
-async def create_product(body: ProductCreate, db: DbSession) -> Product:
-    return await products_service.create_product(db, body)
+async def create_product(
+    body: ProductCreate, db: DbSession, valuation_cache: ValuationCache
+) -> Product:
+    product = await products_service.create_product(db, body)
+    await valuation_cache.invalidate()
+    return product
 
 
 @router.get(
@@ -74,8 +79,12 @@ async def get_product(product_id: int, db: DbSession) -> ProductDetail:
     summary="Edit name, base price or min stock level (admin; SKU is immutable)",
     responses=NOT_FOUND,
 )
-async def update_product(product: ValidProduct, body: ProductUpdate, db: DbSession) -> Product:
-    return await products_service.update_product(db, product, body)
+async def update_product(
+    product: ValidProduct, body: ProductUpdate, db: DbSession, valuation_cache: ValuationCache
+) -> Product:
+    updated = await products_service.update_product(db, product, body)
+    await valuation_cache.invalidate()  # base_price drives the valuation
+    return updated
 
 
 @router.delete(
@@ -85,5 +94,8 @@ async def update_product(product: ValidProduct, body: ProductUpdate, db: DbSessi
     summary="Soft-delete a product (admin)",
     responses=NOT_FOUND,
 )
-async def delete_product(product: ValidProduct, db: DbSession) -> None:
+async def delete_product(
+    product: ValidProduct, db: DbSession, valuation_cache: ValuationCache
+) -> None:
     await products_service.soft_delete_product(db, product)
+    await valuation_cache.invalidate()

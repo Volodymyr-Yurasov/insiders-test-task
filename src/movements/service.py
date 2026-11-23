@@ -117,7 +117,7 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Operatio
     )
     movement_ids = {product_id: movement_id for movement_id, product_id in inserted}
     await db.commit()
-    # Step 6: invalidate valuation cache.  Step 7: schedule low-stock notifications.
+    # Post-commit side effects (cache invalidation, notifications) are run by the router.
 
     return OperationRead(
         id=operation_id,

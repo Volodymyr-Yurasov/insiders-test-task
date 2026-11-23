@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, status
 from src.auth.dependencies import admin_user, current_user
 from src.database import DbSession
 from src.pagination import Page, Pagination
+from src.reports.dependencies import ValuationCache
 from src.warehouses import service as warehouses_service
 from src.warehouses.dependencies import ValidWarehouse
 from src.warehouses.models import Warehouse
@@ -28,8 +29,12 @@ ADMIN_ONLY = [Depends(admin_user)]
     summary="Create a warehouse (admin)",
     responses={409: {"description": "Location code already used"}},
 )
-async def create_warehouse(body: WarehouseCreate, db: DbSession) -> Warehouse:
-    return await warehouses_service.create_warehouse(db, body)
+async def create_warehouse(
+    body: WarehouseCreate, db: DbSession, valuation_cache: ValuationCache
+) -> Warehouse:
+    warehouse = await warehouses_service.create_warehouse(db, body)
+    await valuation_cache.invalidate()
+    return warehouse
 
 
 @router.get("", response_model=Page[WarehouseRead], summary="List warehouses")
@@ -72,6 +77,11 @@ async def get_warehouse_stock(
     },
 )
 async def update_warehouse(
-    warehouse: ValidWarehouse, body: WarehouseUpdate, db: DbSession
+    warehouse: ValidWarehouse,
+    body: WarehouseUpdate,
+    db: DbSession,
+    valuation_cache: ValuationCache,
 ) -> Warehouse:
-    return await warehouses_service.update_warehouse(db, warehouse, body)
+    updated = await warehouses_service.update_warehouse(db, warehouse, body)
+    await valuation_cache.invalidate()  # name/code/is_active appear in the report
+    return updated

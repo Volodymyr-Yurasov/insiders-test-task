@@ -158,7 +158,6 @@ async def create_product(db: AsyncSession, data: ProductCreate) -> Product:
     if product is None:
         raise SkuTaken()
     await db.commit()
-    # Step 6: invalidate valuation cache (new product).
     return product
 
 
@@ -167,7 +166,6 @@ async def update_product(db: AsyncSession, product: Product, changes: ProductUpd
     for field, value in changes.changes().items():
         setattr(product, field, value)
     await db.commit()
-    # Step 6: invalidate valuation cache (base_price affects the report).
     return product
 
 
@@ -186,4 +184,3 @@ async def soft_delete_product(db: AsyncSession, product: Product) -> None:
         raise ProductHasStock()
     product.is_deleted = True
     await db.commit()
-    # Step 6: invalidate valuation cache (product leaves the report).
