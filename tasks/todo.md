@@ -775,3 +775,18 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
 ## Checkpoint: Step 9 complete
 - [x] Suite green; ruff + mypy clean; compose 429 on the 51st request
 - [x] Commit (no self-credit)
+
+---
+---
+
+# Todo — Step 10: Finish
+
+## Task 35: Seed script
+- [x] `python -m src.seed`: storekeeper user, 2 warehouses, 4 products (one below min stock), demo movements only if the ledger is empty; safe to run twice
+
+## Task 36: README
+- [x] Quick start, configuration, API overview, spec → code → test map, design decisions, trade-offs, development commands
+
+## Task 37: Final verification
+- [x] Separate compose project from scratch: healthy, seed twice, login as the seeded storekeeper, list products, valuation as admin
+- [x] Full suite + ruff + mypy + `alembic check`; commit (no self-credit)

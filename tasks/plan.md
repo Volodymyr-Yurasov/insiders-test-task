@@ -757,3 +757,30 @@ Parent plan: [../PLAN.md](../PLAN.md) Step 9. Bonus spec: at most 50 transaction
 ### Checkpoint: Step 9 complete
 - [x] Suite green; ruff + mypy clean; compose: 51st request in a minute → 429
 - [x] Commit (no self-credit)
+
+---
+
+# Implementation Plan: Step 10 — Finish
+
+## Overview
+Make the project easy to run, review and verify from a clean checkout.
+
+## Decisions
+- **README.md** is written for the reviewers of the test task:
+  - quick start
+  - configuration
+  - API overview
+  - **a map from each spec requirement to the code and the test that proves it**
+  - key design decisions and known trade-offs
+  - English, like the code.
+- **Seed script** `python -m src.seed` (runs in the api container):
+  - Idempotent: users/warehouses/products are created with `ON CONFLICT` semantics, and demo movements are only added when the ledger is empty.
+  - Gives reviewers a storekeeper login and data to click through in `/docs`.
+- **Fresh-checkout verification** in a **separate compose project** (`-p inventory-verify`, other host ports), so the developer's dev volume isn't wiped:
+  - build → migrate → seed → smoke flow via curl
+  - then `down -v` of that project only
+
+## Task List
+- [x] Task 35: `src/seed.py` (idempotent demo data)
+- [x] Task 36: README.md (+ PLAN.md status)
+- [x] Task 37: Fresh-project verification (separate compose project) + full suite + ruff/mypy/alembic check; commit

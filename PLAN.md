@@ -2,6 +2,8 @@
 
 Source: `Тестове_завдання_Inventory_Management_Engine_API.docx`. The bonus items (Idempotency-Key, sliding-window rate limit) are treated as core scope.
 
+**Status (2026-11-23): all steps (1-10) implemented and committed; 46 tests green. See README.md for the reviewer-facing summary.**
+
 Stack: Python 3.11+, FastAPI, PostgreSQL 16, SQLAlchemy 2.0 async + asyncpg, Alembic, Redis, Pytest + pytest-asyncio + httpx, Docker Compose.
 
 ---
