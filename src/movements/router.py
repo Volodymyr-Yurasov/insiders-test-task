@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, status
+from fastapi import APIRouter, BackgroundTasks, Depends, status
 
 from src.auth.dependencies import CurrentUser, current_user
 from src.database import DbSession
@@ -13,6 +13,8 @@ from src.movements.schemas import (
     MovementHistoryItem,
     OperationRead,
 )
+from src.notifications import service as notifications_service
+from src.notifications.dependencies import NotifierDep
 from src.pagination import Page, Pagination
 from src.reports.dependencies import ValuationCache
 
@@ -60,11 +62,15 @@ async def list_movements(
     responses=ERRORS,
 )
 async def create_movement(
-    body: MovementCreate, user: CurrentUser, db: DbSession, valuation_cache: ValuationCache
+    body: MovementCreate,
+    user: CurrentUser,
+    db: DbSession,
+    valuation_cache: ValuationCache,
+    notifier: NotifierDep,
+    background_tasks: BackgroundTasks,
 ) -> OperationRead:
-    operation = await movements_service.execute(db, user.id, movements_service.Command.single(body))
-    await valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
-    return operation
+    command = movements_service.Command.single(body)
+    return await _record(command, user.id, db, valuation_cache, notifier, background_tasks)
 
 
 @router.post(
@@ -79,8 +85,30 @@ async def create_movement(
     responses=ERRORS,
 )
 async def create_batch(
-    body: BatchCreate, user: CurrentUser, db: DbSession, valuation_cache: ValuationCache
+    body: BatchCreate,
+    user: CurrentUser,
+    db: DbSession,
+    valuation_cache: ValuationCache,
+    notifier: NotifierDep,
+    background_tasks: BackgroundTasks,
 ) -> OperationRead:
-    operation = await movements_service.execute(db, user.id, movements_service.Command.batch(body))
-    await valuation_cache.invalidate()
-    return operation
+    command = movements_service.Command.batch(body)
+    return await _record(command, user.id, db, valuation_cache, notifier, background_tasks)
+
+
+async def _record(
+    command: movements_service.Command,
+    user_id: int,
+    db: DbSession,
+    valuation_cache: ValuationCache,
+    notifier: NotifierDep,
+    background_tasks: BackgroundTasks,
+) -> OperationRead:
+    """Run the engine, then the post-commit side effects. Any error raises before this point
+    returns, so a rolled-back request neither invalidates the cache nor notifies."""
+    result = await movements_service.execute(db, user_id, command)
+    await valuation_cache.invalidate()  # strictly after the commit (spec 2.4)
+    if result.low_stock:
+        # Runs after the response is sent (spec 2.5: the HTTP response is not blocked).
+        background_tasks.add_task(notifications_service.safe_send, notifier, result.low_stock)
+    return result.operation

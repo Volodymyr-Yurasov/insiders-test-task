@@ -25,6 +25,7 @@ from src.movements.constants import MovementType
 from src.movements.exceptions import InsufficientStock, ProductsNotFound, WarehouseInactive
 from src.movements.models import Operation, StockMovement
 from src.movements.schemas import BatchCreate, MovementCreate, MovementRead, OperationRead
+from src.notifications.schemas import LowStockAlert
 from src.pagination import PageParams, paginate
 from src.products.models import Product
 from src.warehouses.exceptions import WarehouseNotFound
@@ -53,7 +54,21 @@ class Command:
         return cls(body.type, body.from_warehouse_id, body.to_warehouse_id, items)
 
 
-async def execute(db: AsyncSession, user_id: int, command: Command) -> OperationRead:
+@dataclass(frozen=True)
+class LockedProduct:
+    id: int
+    name: str
+    min_stock_level: int
+
+
+@dataclass(frozen=True)
+class ExecutionResult:
+    operation: OperationRead
+    # Source-warehouse threshold crossings caused by this operation (spec 2.5, D6).
+    low_stock: list[LowStockAlert]
+
+
+async def execute(db: AsyncSession, user_id: int, command: Command) -> ExecutionResult:
     try:
         return await _execute(db, user_id, command)
     except DBAPIError as exc:
@@ -63,29 +78,31 @@ async def execute(db: AsyncSession, user_id: int, command: Command) -> Operation
         raise
 
 
-async def _execute(db: AsyncSession, user_id: int, command: Command) -> OperationRead:
+async def _execute(db: AsyncSession, user_id: int, command: Command) -> ExecutionResult:
     # Bound every lock wait in this transaction (int(): never interpolate untrusted text).
     await db.execute(
         text(f"SET LOCAL lock_timeout = '{int(movements_settings.LOCK_TIMEOUT_MS)}ms'")
     )
 
     await _lock_active_warehouses(db, command)
-    product_ids = await _lock_products(db, command)
+    products = await _lock_products(db, command)
+    product_ids = {sku: product.id for sku, product in products.items()}
 
+    # Stock in the source warehouse, read under the locks: `before` for the shortage check
+    # and for low-stock crossings (no extra query).
+    before: dict[int, int] = {}
     if command.type.decreases_source:
         assert command.from_warehouse_id is not None
-        available = await stock.stock_in_warehouse(
-            db, command.from_warehouse_id, product_ids.values()
-        )
+        before = await stock.stock_in_warehouse(db, command.from_warehouse_id, product_ids.values())
         shortages = [
             {
                 "sku": sku,
                 "requested": quantity,
-                "available": available[product_ids[sku]],
-                "missing": quantity - available[product_ids[sku]],
+                "available": before[product_ids[sku]],
+                "missing": quantity - before[product_ids[sku]],
             }
             for sku, quantity in command.items
-            if quantity > available[product_ids[sku]]
+            if quantity > before[product_ids[sku]]
         ]
         if shortages:
             raise InsufficientStock(shortages=shortages)
@@ -119,7 +136,7 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Operatio
     await db.commit()
     # Post-commit side effects (cache invalidation, notifications) are run by the router.
 
-    return OperationRead(
+    operation = OperationRead(
         id=operation_id,
         type=command.type,
         performed_by=user_id,
@@ -136,6 +153,40 @@ async def _execute(db: AsyncSession, user_id: int, command: Command) -> Operatio
             for sku, quantity in command.items
         ],
     )
+    return ExecutionResult(operation, _low_stock_crossings(command, products, before, operation_id))
+
+
+def _low_stock_crossings(
+    command: Command,
+    products: dict[str, LockedProduct],
+    before: dict[int, int],
+    operation_id: int,
+) -> list[LowStockAlert]:
+    """Alert only when this operation crosses the threshold (before >= min > after), so
+    further write-offs below it don't re-alert (D6). Computed from the locked read, hence
+    exactly one of N concurrent write-offs is the one that crosses."""
+    if not command.type.decreases_source:
+        return []
+    assert command.from_warehouse_id is not None
+    alerts = []
+    for sku, quantity in command.items:
+        product = products[sku]
+        stock_before = before[product.id]
+        stock_after = stock_before - quantity
+        if stock_before >= product.min_stock_level > stock_after:
+            alerts.append(
+                LowStockAlert(
+                    operation_id=operation_id,
+                    product_id=product.id,
+                    sku=sku,
+                    product_name=product.name,
+                    warehouse_id=command.from_warehouse_id,
+                    stock_before=stock_before,
+                    stock_after=stock_after,
+                    min_stock_level=product.min_stock_level,
+                )
+            )
+    return alerts
 
 
 async def _lock_active_warehouses(db: AsyncSession, command: Command) -> None:
@@ -156,12 +207,12 @@ async def _lock_active_warehouses(db: AsyncSession, command: Command) -> None:
             raise WarehouseInactive(warehouse_id=warehouse_id)
 
 
-async def _lock_products(db: AsyncSession, command: Command) -> dict[str, int]:
-    """Lock the batch's products in id order; return sku -> id. All unknown SKUs -> 404."""
+async def _lock_products(db: AsyncSession, command: Command) -> dict[str, LockedProduct]:
+    """Lock the batch's products in id order; return sku -> product. All unknown SKUs -> 404."""
     skus = [sku for sku, _ in command.items]
     rows = (
         await db.execute(
-            select(Product.sku, Product.id)
+            select(Product.sku, Product.id, Product.name, Product.min_stock_level)
             .where(Product.sku.in_(skus), Product.is_deleted.is_(False))
             .order_by(Product.id)
             # Decrements need exclusive locks; IN only has to block a concurrent soft-delete
@@ -169,11 +220,11 @@ async def _lock_products(db: AsyncSession, command: Command) -> dict[str, int]:
             .with_for_update(read=not command.type.decreases_source)
         )
     ).all()
-    product_ids = {sku: product_id for sku, product_id in rows}
-    missing = [sku for sku in skus if sku not in product_ids]
+    products = {sku: LockedProduct(id_, name, min_level) for sku, id_, name, min_level in rows}
+    missing = [sku for sku in skus if sku not in products]
     if missing:
         raise ProductsNotFound(missing_skus=missing)
-    return product_ids
+    return products
 
 
 async def list_movements(

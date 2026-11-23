@@ -712,3 +712,24 @@ Also expose `POST /movements/batch`, and map lock timeouts and deadlocks to 503.
 ## Checkpoint: Step 6 complete
 - [x] Suite green; ruff + mypy clean; compose MISS → HIT → movement → MISS
 - [x] Commit (no self-credit)
+
+---
+---
+
+# Todo — Step 7: Low-stock background notifications
+
+## Task 27: Crossings computed by the engine
+- [x] `_lock_products` returns sku → (id, name, min_stock_level). `execute` → `ExecutionResult(operation, low_stock)`. Alerts are only for OUT/TRANSFER where `before >= min > after`.
+- **Files:** `src/movements/{service,schemas}.py`, `src/notifications/schemas.py`
+
+## Task 28: Notifier + background scheduling
+- [x] `Notifier` protocol, `LoggingNotifier`, `safe_send` (never raises), `get_notifier` dependency, `NotificationsConfig.LOW_STOCK_ALERT_EMAIL`
+- [x] `POST /movements` and `/movements/batch` add the background task only when there are alerts
+- **Files:** `src/notifications/{__init__,config,schemas,service,dependencies}.py`, `src/movements/router.py`
+
+## Task 29: Tests
+- [x] `tests/movements/test_notifications.py::test_low_stock_notifications` (crossing once, TRANSFER, batch ×2, failure → none, raising notifier → 201) + `test_logging_notifier_logs_email`
+
+## Checkpoint: Step 7 complete
+- [x] Suite green; ruff + mypy clean; compose log order: `201` access line, then "email sent"
+- [x] Commit (no self-credit)

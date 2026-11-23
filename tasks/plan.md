@@ -630,3 +630,45 @@ Parent plan: [../PLAN.md](../PLAN.md) Step 6. Spec 2.4: the valuation result is 
 | Stale write-back race | High | Generation keys + a deterministic interleaving test. |
 | Redis outage breaks the report or the writes | Med | Every Redis call is wrapped; BYPASS read path; invalidation is log-only on failure; tested with an unreachable Redis. |
 | Thundering herd on a cold cache | Low | NX lock + bounded polling; tested (1 compute for 10 concurrent requests). |
+
+---
+
+# Implementation Plan: Step 7 — Low-stock background notifications
+
+Parent plan: [../PLAN.md](../PLAN.md) Step 7. Spec 2.5: when a write-off takes a product's stock below `min_stock_level`, start a FastAPI `BackgroundTasks` job that "sends an email" (logging the send is enough). The HTTP response must not block on it.
+
+## Architecture Decisions
+- **When (D6):**
+  - Per **source warehouse**, for OUT and TRANSFER: both deplete the source.
+  - Only on the **crossing**: `before >= min_stock_level > after`, so later write-offs below the threshold don't re-alert.
+  - `min_stock_level = 0` can never alert, since stock can't go below 0.
+- **Data comes free from the engine:**
+  - The engine already computes `before` (the locked stock read) for every item. `after = before - qty`.
+  - `_lock_products` additionally selects `name` and `min_stock_level` in the same statement.
+  - The crossings are computed under the lock, so they're consistent even under concurrency: of N concurrent write-offs, exactly the one that crosses alerts.
+- **Shape:**
+  - `movements_service.execute` returns `ExecutionResult(operation, low_stock: list[LowStockAlert])`.
+  - `LowStockAlert` is **plain data** (product id/sku/name, warehouse id, before, after, min level, operation id). The DB session is closed by the time the task runs, so no ORM objects or sessions go into the task.
+- **Notifier** (`src/notifications/`):
+  - A `Notifier` protocol, with `LoggingNotifier.send_low_stock(alerts)` logging one "email sent to <LOW_STOCK_ALERT_EMAIL>" line per alert.
+  - Provided through a dependency (`get_notifier`), so tests swap it with `app.dependency_overrides`.
+  - `safe_send()` wraps it: any exception is logged and swallowed. A broken mail server must never surface as an error after the client already got its 201. Starlette would otherwise re-raise it in the server, and in tests through the transport.
+- **Scheduling:**
+  - Router: `background_tasks.add_task(safe_send, notifier, alerts)` only when `alerts` is non-empty, and only after a successful commit. A rolled-back request (409, 404…) never notifies.
+  - Starlette sends the response first, then runs the task.
+- **Config:** `LOW_STOCK_ALERT_EMAIL` (default `inventory-alerts@example.com`, a reserved example domain).
+
+## Task List
+- [x] Task 27: Engine computes low-stock crossings (`ExecutionResult`, `LowStockAlert`)
+- [x] Task 28: Notifications package (protocol, logging notifier, `safe_send`, dependency) + scheduling in both movement routes
+- [x] Task 29: Test `test_low_stock_notifications`:
+  - crossing alerts once; no re-alert below the threshold
+  - TRANSFER alerts per source warehouse
+  - a batch with 2 crossings → 2 alerts
+  - a failed request → none
+  - a raising notifier → still 201
+  - the logging notifier writes the "email sent" line
+
+### Checkpoint: Step 7 complete
+- [x] Suite green; ruff + mypy clean; compose: an OUT crossing the threshold logs "email sent" **after** uvicorn's `201` access line
+- [x] Commit (no self-credit)
